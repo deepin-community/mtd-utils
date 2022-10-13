@@ -1,0 +1,2 @@
+include/libmtd.h usr/include
+libmtd.a usr/lib/${DEB_HOST_MULTIARCH}

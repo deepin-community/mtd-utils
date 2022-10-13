@@ -1,0 +1,6 @@
+include/libscan.h usr/include
+include/libubi.h usr/include
+include/libubigen.h usr/include
+libscan.a usr/lib/${DEB_HOST_MULTIARCH}
+libubi.a usr/lib/${DEB_HOST_MULTIARCH}
+libubigen.a usr/lib/${DEB_HOST_MULTIARCH}

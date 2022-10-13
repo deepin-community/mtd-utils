@@ -1,0 +1,35 @@
+From: Bastian Germann <bastiangermann@fishpost.de>
+Date: Wed, 16 Dec 2020 19:04:03 +0100
+Subject: Link with system iniparser
+Forwarded: not-needed
+---
+ ubi-utils/Makemodule.am | 2 +-
+ ubi-utils/ubinize.c     | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ubi-utils/Makemodule.am b/ubi-utils/Makemodule.am
+index 2835702..0b3154f 100644
+--- a/ubi-utils/Makemodule.am
++++ b/ubi-utils/Makemodule.am
+@@ -20,7 +20,7 @@ ubidetach_SOURCES = ubi-utils/ubidetach.c
+ ubidetach_LDADD = libmtd.a libubi.a
+ 
+ ubinize_SOURCES = ubi-utils/ubinize.c
+-ubinize_LDADD = libubi.a libubigen.a libmtd.a libiniparser.a
++ubinize_LDADD = libubi.a libubigen.a libmtd.a -liniparser
+ 
+ ubiformat_SOURCES = ubi-utils/ubiformat.c include/mtd_swab.h
+ ubiformat_LDADD = libubi.a libubigen.a libmtd.a libscan.a
+diff --git a/ubi-utils/ubinize.c b/ubi-utils/ubinize.c
+index 967b65c..9fbbef9 100644
+--- a/ubi-utils/ubinize.c
++++ b/ubi-utils/ubinize.c
+@@ -34,7 +34,7 @@
+ 
+ #include <mtd/ubi-media.h>
+ #include <libubigen.h>
+-#include <libiniparser.h>
++#include <iniparser/iniparser.h>
+ #include <libubi.h>
+ #include "common.h"
+ 

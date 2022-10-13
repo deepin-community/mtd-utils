@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS=hardening=+all
+
+%:
+	dh $@
+
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+CONFIGURE_ARGS = --enable-unit-tests
+else
+CONFIGURE_ARGS = --disable-unit-tests
+endif
+
+override_dh_auto_configure:
+	dh_auto_configure -- --with-selinux $(CONFIGURE_ARGS)
+
+# tests are known to pass only on the listed architectures
+ifeq (,$(filter amd64 armel armhf arm64 i386 mipsel s390x x32,$(DEB_HOST_ARCH)))
+override_dh_auto_test:
+	-dh_auto_test
+endif

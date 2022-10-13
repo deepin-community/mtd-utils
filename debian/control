@@ -1,0 +1,48 @@
+Source: mtd-utils
+Section: utils
+Priority: optional
+Maintainer: Bastian Germann <bastiangermann@fishpost.de>
+Uploaders: Riku Voipio <riku.voipio@linaro.org>
+Build-Depends: debhelper-compat (= 13), pkg-config, zlib1g-dev,
+ libacl1-dev, libcmocka-dev <!nocheck>, liblzo2-dev, uuid-dev, libzstd-dev,
+ libiniparser-dev, libselinux1-dev, libssl-dev
+Standards-Version: 4.5.1
+Rules-Requires-Root: no
+Homepage: http://www.linux-mtd.infradead.org/
+Vcs-Git: https://salsa.debian.org/debian/mtd-utils.git
+Vcs-Browser: https://salsa.debian.org/debian/mtd-utils
+
+Package: mtd-utils
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Multi-Arch: foreign
+Provides: mtd-tools
+Replaces: mtd-tools
+Description: Memory Technology Device Utilities
+ Utilities for manipulating memory technology devices, such as flash
+ memory, Disk-On-Chip, or ROM.  Includes the following tools:
+ docfdisk, doc_loadbios, flashcp, flash_erase, flash_eraseall, flash_lock,
+ flash_otp_dump, flash_otp_info, flash_otp_lock, flash_otp_write, flash_unlock,
+ ftl_check, ftl_format, jffs2dump, jffs2reader, lsmtd, mkfs.jffs2, mkfs.ubifs,
+ mtd_debug, mtdinfo, mtdpart, nanddump, nandtest, nandwrite, nftldump,
+ nftl_format, recv_image, rfddump, rfdformat, serve_image, sumtool, ubiattach,
+ ubiblock, ubicrc32, ubidetach, ubiformat, ubihealthd, ubimkvol, ubinfo,
+ ubinize, ubirename, ubirmvol, ubirsvol, ubiupdatevol.
+
+Package: libmtd-dev
+Section: libdevel
+Architecture: linux-any
+Depends: ${misc:Depends}
+Multi-Arch: same
+Description: Memory Technology Device Development Libraries
+ Development header and libraries for manipulating memory technology
+ devices, such as flash memory, Disk-On-Chip, or ROM.
+
+Package: libubi-dev
+Section: libdevel
+Architecture: linux-any
+Depends: ${misc:Depends}
+Multi-Arch: same
+Description: UBIFS Development Libraries
+ Development header and libraries for manipulating unsorted block
+ image file systems.
