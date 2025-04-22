@@ -17,55 +17,6 @@
 
 extern int page_size;
 
-/* LIST IMPLEMENTATION (from linux/list.h) */
-
-#define LIST_HEAD_INIT(name) { &(name), &(name) }
-
-#define LIST_HEAD(name) \
-	struct list_head name = LIST_HEAD_INIT(name)
-
-static inline void __list_add(struct list_head *new,
-		struct list_head *prev,
-		struct list_head *next)
-{
-	next->prev = new;
-	new->next = next;
-	new->prev = prev;
-	prev->next = new;
-}
-
-static inline void list_add(struct list_head *new, struct list_head *head)
-{
-	__list_add(new, head, head->next);
-}
-
-static inline void list_add_tail(struct list_head *new, struct list_head *head)
-{
-	__list_add(new, head->prev, head);
-}
-
-static inline void __list_del(struct list_head *prev, struct list_head *next)
-{
-	next->prev = prev;
-	prev->next = next;
-}
-
-static inline void list_del(struct list_head *entry)
-{
-	__list_del(entry->prev, entry->next);
-	entry->next = (void *) 0;
-	entry->prev = (void *) 0;
-}
-
-#define list_entry(ptr, type, member) \
-	((type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member)))
-
-#define list_for_each_entry(pos, head, member)                          \
-	for (pos = list_entry((head)->next, typeof(*pos), member);      \
-			&pos->member != (head);                                    \
-			pos = list_entry(pos->member.next, typeof(*pos), member))
-
-
 /* Available compressors are on this list */
 static LIST_HEAD(jffs2_compressor_list);
 
@@ -511,13 +462,13 @@ reinsert:
 
 int jffs2_compressors_init(void)
 {
-#ifdef CONFIG_JFFS2_ZLIB
+#ifdef WITH_ZLIB
 	jffs2_zlib_init();
 #endif
 #ifdef CONFIG_JFFS2_RTIME
 	jffs2_rtime_init();
 #endif
-#ifdef CONFIG_JFFS2_LZO
+#ifdef WITH_LZO
 	jffs2_lzo_init();
 #endif
 	return 0;
@@ -528,10 +479,10 @@ int jffs2_compressors_exit(void)
 #ifdef CONFIG_JFFS2_RTIME
 	jffs2_rtime_exit();
 #endif
-#ifdef CONFIG_JFFS2_ZLIB
+#ifdef WITH_ZLIB
 	jffs2_zlib_exit();
 #endif
-#ifdef CONFIG_JFFS2_LZO
+#ifdef WITH_LZO
 	jffs2_lzo_exit();
 #endif
 	return 0;

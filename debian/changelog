@@ -1,3 +1,54 @@
+mtd-utils (1:2.3.0-1) unstable; urgency=medium
+
+  * QA upload.
+  * d/gbp.conf: set debian-branch = debian/latest
+  * New upstream version 2.3.0
+  * Bump Standards-Version: 4.7.2
+  * d/copyright: delete not exist Files: ubifs-utils/mkfs.ubifs/sign.* info
+
+ -- xiao sheng wen <atzlinux@debian.org>  Sat, 29 Mar 2025 16:51:04 +0800
+
+mtd-utils (1:2.2.0-2) unstable; urgency=medium
+
+  * QA upload
+  * Skip tests on armel and armhf due to broken mocking (Closes: #1065956)
+
+ -- Bastian Germann <bage@debian.org>  Thu, 02 May 2024 18:37:36 +0000
+
+mtd-utils (1:2.2.0-1) unstable; urgency=medium
+
+  * QA upload
+  * New upstream version
+
+ -- Bastian Germann <bage@debian.org>  Sat, 30 Mar 2024 14:37:16 +0100
+
+mtd-utils (1:2.1.6-1) unstable; urgency=medium
+
+  * QA upload
+  * New upstream version
+
+ -- Bastian Germann <bage@debian.org>  Mon, 04 Sep 2023 17:22:59 +0200
+
+mtd-utils (1:2.1.5-1) unstable; urgency=medium
+
+  * New upstream version
+
+ -- Bastian Germann <bage@debian.org>  Tue, 11 Oct 2022 00:51:34 +0200
+
+mtd-utils (1:2.1.4-1) unstable; urgency=medium
+
+  * New upstream version
+  * Add ubiscan utility
+
+ -- Bastian Germann <bage@debian.org>  Mon, 10 Jan 2022 09:49:49 +0100
+
+mtd-utils (1:2.1.3-2) unstable; urgency=medium
+
+  * Set bage's debian.org email
+  * Remove Riku (emeritus) from Uploaders (Closes: #1001564)
+
+ -- Bastian Germann <bage@debian.org>  Fri, 10 Dec 2021 18:24:37 +0100
+
 mtd-utils (1:2.1.3-1) unstable; urgency=medium
 
   * New upstream version

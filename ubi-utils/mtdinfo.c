@@ -30,6 +30,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mtd/mtd-user.h>
+#include <mtd/ubi-media.h>
 
 #include <libubigen.h>
 #include <libmtd.h>
@@ -54,7 +55,7 @@ static void display_help(void)
 	printf(
 		"%1$s version %2$s - a tool to print MTD information.\n"
 		"\n"
-		"Usage: %1$s <MTD node file path> [--map | -M] [--ubi-info | -u]\n"
+		"Usage: %1$s <mtd device> [--map | -M] [--ubi-info | -u]\n"
 		"       %1$s --all [--ubi-info | -u]\n"
 		"       %1$s [--help | --version]\n"
 		"\n"
@@ -67,6 +68,8 @@ static void display_help(void)
 		"                                than, e.g., `mtdinfo /dev/mtdX'\n"
 		"-h, --help                      print help message\n"
 		"-V, --version                   print program version\n"
+		"\n"
+		"<mtd device>  MTD device node or 'mtd:<name>'\n"
 		"\n"
 		"Examples:\n"
 		"  %1$s /dev/mtd0             print information MTD device /dev/mtd0\n"
@@ -124,10 +127,13 @@ static int parse_opt(int argc, char * const argv[])
 		}
 	}
 
-	if (optind == argc - 1)
-		args.node = argv[optind];
-	else if (optind < argc)
+	if (optind == argc - 1) {
+		args.node = mtd_find_dev_node(argv[optind]);
+		if (!args.node)
+			return errmsg("Failed to find MTD device %s", argv[optind]);
+	} else if (optind < argc) {
 		return errmsg("more then one MTD device specified (use -h for help)");
+	}
 
 	if (args.all && args.node)
 		args.node = NULL;
@@ -179,7 +185,7 @@ static void print_ubi_info(const struct mtd_info *mtd_info,
 static void print_region_map(const struct mtd_dev_info *mtd, int fd,
 			     const region_info_t *reginfo)
 {
-	unsigned long start;
+	unsigned long long start;
 	int i, width;
 	int ret_locked, errno_locked, ret_bad, errno_bad;
 
@@ -197,8 +203,8 @@ static void print_region_map(const struct mtd_dev_info *mtd, int fd,
 		ret_locked = ret_bad = errno_locked = errno_bad = 0;
 
 	for (i = 0; i < reginfo->numblocks; ++i) {
-		start = reginfo->offset + i * reginfo->erasesize;
-		printf(" %*i: %08lx ", width, i, start);
+		start = reginfo->offset + (unsigned long long)i * reginfo->erasesize;
+		printf(" %*i: %08llx ", width, i, start);
 
 		if (ret_locked != -1) {
 			ret_locked = mtd_is_locked(mtd, fd, i);

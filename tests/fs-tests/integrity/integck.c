@@ -2577,6 +2577,122 @@ static int rm_minus_rf_dir(const char *dir_name)
 	return 0;
 }
 
+/*
+ * Detach the MTD device from UBI and attach it back. This function is used
+ * whed performing emulated power cut testing andthe power cuts are amulated by
+ * UBI, not by UBIFS. In this case, to recover from the emulated power cut we
+ * have to unmount UBIFS and re-attach the MTD device.
+ */
+static int reattach(void)
+{
+	int err = 0;
+	libubi_t libubi;
+	struct ubi_attach_request req;
+
+	libubi = libubi_open();
+	if (!libubi) {
+		if (errno == 0)
+			return errmsg("UBI is not present in the system");
+		return sys_errmsg("cannot open libubi");
+	}
+
+	err = ubi_detach_mtd(libubi, "/dev/ubi_ctrl", args.mtdn);
+	if (err) {
+		sys_errmsg("cannot detach mtd%d", args.mtdn);
+		goto out;
+	}
+
+	req.dev_num = UBI_DEV_NUM_AUTO;
+	req.mtd_num = args.mtdn;
+	req.vid_hdr_offset = 0;
+	req.mtd_dev_node = NULL;
+	req.max_beb_per1024 = 0;
+
+	err = ubi_attach(libubi, "/dev/ubi_ctrl", &req);
+	if (err)
+		sys_errmsg("cannot attach mtd%d", args.mtdn);
+
+out:
+	libubi_close(libubi);
+	return err;
+}
+
+/**
+ * Unmount and mount back the test file-system.
+ */
+static int umount_and_remount(int mounted, int reatt, int um_rorw)
+{
+	int ret = 0;
+	unsigned long flags;
+
+	if (mounted)
+		CHECK(umount(fsinfo.mount_point) != -1);
+
+	if (reatt)
+		CHECK(reattach() == 0);
+
+	if (!um_rorw) {
+		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
+			    fsinfo.fstype, fsinfo.mount_flags,
+			    fsinfo.mount_opts);
+		if (ret) {
+			pcv("unmounted %s, but cannot mount it back R/W",
+			    fsinfo.mount_point);
+			return -1;
+		}
+	} else {
+		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
+			    fsinfo.fstype, fsinfo.mount_flags | MS_RDONLY,
+			    fsinfo.mount_opts);
+		if (ret) {
+			pcv("unmounted %s, but cannot mount it back R/O",
+			    fsinfo.mount_point);
+			return -1;
+		}
+
+		flags = fsinfo.mount_flags | MS_REMOUNT;
+		flags &= ~((unsigned long)MS_RDONLY);
+		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
+			    fsinfo.fstype, flags, fsinfo.mount_opts);
+		if (ret) {
+			pcv("unmounted %s, mounted R/O, but cannot re-mount it R/W",
+			     fsinfo.mount_point);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Remount the test file-system RO first, then RW.
+ */
+static int remount_ro_rw(const char *tries)
+{
+	int ret;
+	unsigned long flags;
+
+	flags = fsinfo.mount_flags | MS_RDONLY | MS_REMOUNT;
+	ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
+		    flags, fsinfo.mount_opts);
+	if (ret) {
+		pcv("cannot remount %s R/O%s", tries, fsinfo.mount_point);
+		return -1;
+	}
+
+	flags = fsinfo.mount_flags | MS_REMOUNT;
+	flags &= ~((unsigned long)MS_RDONLY);
+	ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
+		    flags, fsinfo.mount_opts);
+	if (ret) {
+		pcv("remounted %s R/O%s, but cannot re-mount it R/W",
+		    tries, fsinfo.mount_point);
+		return -1;
+	}
+
+	return 0;
+}
+
 /**
  * Re-mount the test file-system. This function randomly select how to
  * re-mount.
@@ -2601,24 +2717,9 @@ static int remount_tested_fs(void)
 		um = 1;
 
 	if (rorw1) {
-		flags = fsinfo.mount_flags | MS_RDONLY | MS_REMOUNT;
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("cannot remount %s R/O (1)",
-			    fsinfo.mount_point);
+		ret = remount_ro_rw(" (1)");
+		if (ret)
 			return -1;
-		}
-
-		flags = fsinfo.mount_flags | MS_REMOUNT;
-		flags &= ~((unsigned long)MS_RDONLY);
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("remounted %s R/O (1), but cannot re-mount it R/W",
-			    fsinfo.mount_point);
-			return -1;
-		}
 	}
 
 	if (um) {
@@ -2633,61 +2734,15 @@ static int remount_tested_fs(void)
 			}
 		}
 
-		ret = umount(fsinfo.mount_point);
-		if (ret) {
-			pcv("cannot unmount %s", fsinfo.mount_point);
+		ret = umount_and_remount(1, 0, um_rorw);
+		if (ret)
 			return -1;
-		}
-
-		if (!um_rorw) {
-			ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-				    fsinfo.fstype, fsinfo.mount_flags,
-				    fsinfo.mount_opts);
-			if (ret) {
-				pcv("unmounted %s, but cannot mount it back R/W",
-				    fsinfo.mount_point);
-				return -1;
-			}
-		} else {
-			ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-				    fsinfo.fstype, fsinfo.mount_flags | MS_RDONLY,
-				    fsinfo.mount_opts);
-			if (ret) {
-				pcv("unmounted %s, but cannot mount it back R/O",
-				    fsinfo.mount_point);
-				return -1;
-			}
-
-			flags = fsinfo.mount_flags | MS_REMOUNT;
-			flags &= ~((unsigned long)MS_RDONLY);
-			ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-				    fsinfo.fstype, flags, fsinfo.mount_opts);
-			if (ret) {
-				pcv("unmounted %s, mounted R/O, but cannot re-mount it R/W",
-				     fsinfo.mount_point);
-				return -1;
-			}
-		}
 	}
 
 	if (rorw2) {
-		flags = fsinfo.mount_flags | MS_RDONLY | MS_REMOUNT;
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("cannot re-mount %s R/O (3)", fsinfo.mount_point);
+		ret = remount_ro_rw(" (3)");
+		if (ret)
 			return -1;
-		}
-
-		flags = fsinfo.mount_flags | MS_REMOUNT;
-		flags &= ~((unsigned long)MS_RDONLY);
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("remounted %s R/O (3), but cannot re-mount it back R/W",
-			     fsinfo.mount_point);
-			return -1;
-		}
 	}
 
 	CHECK(chdir(fsinfo.mount_point) == 0);
@@ -3144,53 +3199,12 @@ static void free_fs_info(struct dir_info *dir)
 }
 
 /*
- * Detach the MTD device from UBI and attach it back. This function is used
- * whed performing emulated power cut testing andthe power cuts are amulated by
- * UBI, not by UBIFS. In this case, to recover from the emulated power cut we
- * have to unmount UBIFS and re-attach the MTD device.
- */
-static int reattach(void)
-{
-	int err = 0;
-	libubi_t libubi;
-	struct ubi_attach_request req;
-
-	libubi = libubi_open();
-	if (!libubi) {
-		if (errno == 0)
-			return errmsg("UBI is not present in the system");
-		return sys_errmsg("cannot open libubi");
-	}
-
-	err = ubi_detach_mtd(libubi, "/dev/ubi_ctrl", args.mtdn);
-	if (err) {
-		sys_errmsg("cannot detach mtd%d", args.mtdn);
-		goto out;
-	}
-
-	req.dev_num = UBI_DEV_NUM_AUTO;
-	req.mtd_num = args.mtdn;
-	req.vid_hdr_offset = 0;
-	req.mtd_dev_node = NULL;
-	req.max_beb_per1024 = 0;
-
-	err = ubi_attach(libubi, "/dev/ubi_ctrl", &req);
-	if (err)
-		sys_errmsg("cannot attach mtd%d", args.mtdn);
-
-out:
-	libubi_close(libubi);
-	return err;
-}
-
-/*
  * Recover the tested file-system from an emulated power cut failure by
  * unmounting it and mounting it again.
  */
 static int recover_tested_fs(void)
 {
 	int ret;
-	unsigned long flags;
 	unsigned int  um_rorw, rorw2;
 	struct mntent *mntent;
 
@@ -3206,60 +3220,15 @@ static int recover_tested_fs(void)
 	 * while mounting in 'remount_tested_fs()'.
 	 */
 	mntent = get_tested_fs_mntent();
-	if (mntent)
-		CHECK(umount(fsinfo.mount_point) != -1);
 
-	if (args.reattach)
-		CHECK(reattach() == 0);
-
-	if (!um_rorw) {
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-			    fsinfo.fstype, fsinfo.mount_flags,
-			    fsinfo.mount_opts);
-		if (ret) {
-			pcv("unmounted %s, but cannot mount it back R/W",
-			    fsinfo.mount_point);
-			return -1;
-		}
-	} else {
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-			    fsinfo.fstype, fsinfo.mount_flags | MS_RDONLY,
-			    fsinfo.mount_opts);
-		if (ret) {
-			pcv("unmounted %s, but cannot mount it back R/O",
-			    fsinfo.mount_point);
-			return -1;
-		}
-
-		flags = fsinfo.mount_flags | MS_REMOUNT;
-		flags &= ~((unsigned long)MS_RDONLY);
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point,
-			    fsinfo.fstype, flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("unmounted %s, mounted R/O, but cannot re-mount it R/W",
-			     fsinfo.mount_point);
-			return -1;
-		}
-	}
+	ret = umount_and_remount(!!mntent, args.reattach, um_rorw);
+	if (ret)
+		return -1;
 
 	if (rorw2) {
-		flags = fsinfo.mount_flags | MS_RDONLY | MS_REMOUNT;
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("cannot re-mount %s R/O", fsinfo.mount_point);
+		ret = remount_ro_rw("");
+		if (ret)
 			return -1;
-		}
-
-		flags = fsinfo.mount_flags | MS_REMOUNT;
-		flags &= ~((unsigned long)MS_RDONLY);
-		ret = mount(fsinfo.fsdev, fsinfo.mount_point, fsinfo.fstype,
-			    flags, fsinfo.mount_opts);
-		if (ret) {
-			pcv("remounted %s R/O, but cannot re-mount it back R/W",
-			     fsinfo.mount_point);
-			return -1;
-		}
 	}
 
 	return 0;

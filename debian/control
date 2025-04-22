@@ -1,12 +1,11 @@
 Source: mtd-utils
 Section: utils
 Priority: optional
-Maintainer: Bastian Germann <bastiangermann@fishpost.de>
-Uploaders: Riku Voipio <riku.voipio@linaro.org>
+Maintainer: Debian QA Group <packages@qa.debian.org>
 Build-Depends: debhelper-compat (= 13), pkg-config, zlib1g-dev,
  libacl1-dev, libcmocka-dev <!nocheck>, liblzo2-dev, uuid-dev, libzstd-dev,
  libiniparser-dev, libselinux1-dev, libssl-dev
-Standards-Version: 4.5.1
+Standards-Version: 4.7.2
 Rules-Requires-Root: no
 Homepage: http://www.linux-mtd.infradead.org/
 Vcs-Git: https://salsa.debian.org/debian/mtd-utils.git

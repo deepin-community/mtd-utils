@@ -25,6 +25,7 @@
 
 #include <ctype.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <mtd/ubi-user.h>
 
 #ifdef __cplusplus
@@ -53,6 +54,8 @@ typedef void * libubi_t;
  * @vid_hdr_offset: VID header offset (%0 means default offset and this is what
  *                  most of the users want)
  * @max_beb_per1024: Maximum expected bad eraseblocks per 1024 eraseblocks
+ * @disable_fm: whether disable fastmap
+ * @need_resv_pool: whether reserve free pebs for filling pool/wl_pool
  */
 struct ubi_attach_request
 {
@@ -61,6 +64,8 @@ struct ubi_attach_request
 	const char *mtd_dev_node;
 	int vid_hdr_offset;
 	int max_beb_per1024;
+	bool disable_fm;
+	bool need_resv_pool;
 };
 
 /**
@@ -426,8 +431,8 @@ int ubi_vol_block_remove(int fd);
  * @bytes: how many bytes will be written to the volume
  *
  * This function initiates UBI volume update and returns %0 in case of success
- * and %-1 in case of error. The caller is assumed to write @bytes data to the
- * volume @fd afterward.
+ * and %-1 in case of error (errno is set). The caller is assumed to write
+ * @bytes data to the volume @fd afterward.
  */
 int ubi_update_start(libubi_t desc, int fd, long long bytes);
 
@@ -481,6 +486,21 @@ int ubi_leb_unmap(int fd, int lnum);
  * set with %EBADF error code.
  */
 int ubi_is_mapped(int fd, int lnum);
+
+/**
+ * ubi_leb_map - map logical eraseblock to a physical eraseblock.
+ * @fd: volume character device file descriptor
+ * @lnum: logical eraseblock number
+ *
+ * This function maps an un-mapped logical eraseblock @lnum to a physical
+ * eraseblock. This means, that after a successful invocation of this
+ * function the logical eraseblock @lnum will be empty (contain only %0xFF
+ * bytes) and be mapped to a physical eraseblock, even if an unclean reboot
+ * happens.
+ *
+ * This function returns zero in case of success, %-1 in case of failures.
+ */
+int ubi_leb_map(int fd, int lnum);
 
 #ifdef __cplusplus
 }
