@@ -120,10 +120,6 @@ License: Expat
  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  DEALINGS IN THE SOFTWARE.
 
-Files: ubifs-utils/mkfs.ubifs/sign.*
-Copyright: Copyright (C) 2018 Pengutronix
-License: GPL-2+
-
 License: GPL-2+
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by

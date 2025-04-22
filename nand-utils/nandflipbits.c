@@ -203,7 +203,8 @@ int main(int argc, char **argv)
 		int page;
 
 		if (bits_to_flip[i].offset >= mtdlen) {
-			fprintf(stderr, "Invalid byte offset %lld (max %lld)\n",
+			fprintf(stderr, "Invalid byte offset %" PRId64
+				" (max %" PRId64 ")\n",
 				bits_to_flip[i].offset, mtdlen);
 			ret = EXIT_FAILURE;
 			goto free_buf;
@@ -249,7 +250,9 @@ int main(int argc, char **argv)
 
 			bufoffs += mtd.min_io_size;
 
-			ret = mtd_read_oob(mtd_desc, &mtd, fd, blkoffs,
+			ret = mtd_read_oob(mtd_desc, &mtd, fd,
+					   (unsigned long long)bit_to_flip->block * mtd.eb_size +
+					   blkoffs,
 					   mtd.oob_size, buffer + bufoffs);
 			if (ret) {
 				fprintf(stderr, "MTD OOB read failure\n");

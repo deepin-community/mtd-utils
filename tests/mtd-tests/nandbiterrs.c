@@ -63,12 +63,13 @@
 #define MODE_INCREMENTAL 0x02
 #define MODE_OVERWRITE 0x04
 #define PAGE_ERASED 0x08
+#define CONTINUOUS_READ 0x10
 
 static int peb = -1, page = -1, max_overwrite = -1, seed = -1;
 static const char *mtddev;
 
 static unsigned char *wbuffer, *rbuffer, *old_data;
-static int fd, pagesize, pagecount, flags;
+static int fd, pagesize, bs, pagecount, flags;
 static struct mtd_dev_info mtd;
 static libmtd_t mtd_desc;
 
@@ -81,6 +82,7 @@ static const struct option options[] = {
 	{ "erased", no_argument, NULL, 'e' },
 	{ "writes", required_argument, NULL, 'w' },
 	{ "incremental", no_argument, NULL, 'i' },
+	{ "continuous", no_argument, NULL, 'c' },
 	{ "overwrite", no_argument, NULL, 'o' },
 	{ NULL, 0, NULL, 0 },
 };
@@ -95,7 +97,8 @@ static NORETURN void usage(int status)
 	"  -b, --peb <num>     Use this physical erase block\n"
 	"  -p, --page <num>    Use this page within the erase block\n"
 	"  -s, --seed <num>    Specify seed for PRNG\n"
-	"  -e, --erased        Test erased pages instead of written pages\n\n"
+	"  -e, --erased        Test erased pages instead of written pages\n"
+	"  -c, --continuous    Use two consecutive pages (incremental test only)\n\n"
 	"Options controling test mode:\n"
 	"  -i, --incremental   Manually insert bit errors until ECC fails\n"
 	"  -o, --overwrite     Rewrite page until bits flip and ECC fails\n\n"
@@ -124,7 +127,7 @@ static void process_options(int argc, char **argv)
 	int c;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hkb:p:s:eiow:", options, NULL);
+		c = getopt_long(argc, argv, "hkb:p:s:eiow:c", options, NULL);
 		if (c == -1)
 			break;
 
@@ -175,6 +178,9 @@ static void process_options(int argc, char **argv)
 		case 'e':
 			flags |= PAGE_ERASED;
 			break;
+		case 'c':
+			flags |= CONTINUOUS_READ;
+			break;
 		case 'h':
 			usage(EXIT_SUCCESS);
 		default:
@@ -192,6 +198,9 @@ static void process_options(int argc, char **argv)
 
 	if (!(flags & (MODE_OVERWRITE|MODE_INCREMENTAL)))
 		errmsg_die("No test mode specified!");
+
+	if (flags & CONTINUOUS_READ && !(flags & MODE_INCREMENTAL))
+		errmsg_die("Use --continuous with --incremental only!");
 
 	if ((max_overwrite > 0) && !(flags & MODE_OVERWRITE))
 		errmsg_die("Write count specified but mode is not --overwrite!");
@@ -235,9 +244,9 @@ static void init_buffer(void)
 	unsigned int i;
 
 	if (flags & PAGE_ERASED) {
-		memset(wbuffer, 0xff, pagesize);
+		memset(wbuffer, 0xff, bs);
 	} else {
-		for (i = 0; i < pagesize; ++i)
+		for (i = 0; i < bs; ++i)
 			wbuffer[i] = hash(i+seed);
 	}
 }
@@ -251,7 +260,7 @@ static int write_page(void)
 		goto fail_mode;
 
 	err = mtd_write(mtd_desc, &mtd, fd, peb, page*pagesize,
-					wbuffer, pagesize, NULL, 0, 0);
+					wbuffer, bs, NULL, 0, 0);
 
 	if (err)
 		fprintf(stderr, "Failed to write page %d in block %d\n", peb, page);
@@ -290,7 +299,7 @@ static int read_page(void)
 	if (ioctl(fd, ECCGETSTATS, &old) != 0)
 		goto failstats;
 
-	err = mtd_read(&mtd, fd, peb, page*pagesize, rbuffer, pagesize);
+	err = mtd_read(&mtd, fd, peb, page*pagesize, rbuffer, bs);
 	if (err) {
 		fputs("Read failed!\n", stderr);
 		return -1;
@@ -316,7 +325,7 @@ static int verify_page(void)
 	int erased = flags & PAGE_ERASED;
 	unsigned int i, errs = 0;
 
-	for (i = 0; i < pagesize; ++i) {
+	for (i = 0; i < bs; ++i) {
 		if (rbuffer[i] != (erased ? 0xff : hash(i+seed)))
 			++errs;
 	}
@@ -332,7 +341,7 @@ static int insert_biterror(void)
 {
 	int bit, mask, byte;
 
-	for (byte = 0; byte < pagesize; ++byte) {
+	for (byte = 0; byte < bs; ++byte) {
 		for (bit = 7, mask = 0x80; bit >= 0; bit--, mask >>= 1) {
 			if (wbuffer[byte] & mask) {
 				wbuffer[byte] &= ~mask;
@@ -461,6 +470,10 @@ int main(int argc, char **argv)
 
 	pagesize = mtd.subpage_size;
 	pagecount = mtd.eb_size / pagesize;
+	if (!(flags & CONTINUOUS_READ))
+		bs = pagesize;
+	else
+		bs = 2 * pagesize;
 
 	if (peb >= mtd.eb_cnt)
 		return errmsg("Physical erase block %d is out of range!", peb);
@@ -483,13 +496,13 @@ int main(int argc, char **argv)
 		}
 	}
 
-	wbuffer = malloc(pagesize);
+	wbuffer = malloc(bs);
 	if (!wbuffer) {
 		perror(NULL);
 		goto fail_dev;
 	}
 
-	rbuffer = malloc(pagesize);
+	rbuffer = malloc(bs);
 	if (!rbuffer) {
 		perror(NULL);
 		goto fail_rbuffer;

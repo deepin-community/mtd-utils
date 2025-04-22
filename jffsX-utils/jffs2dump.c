@@ -757,11 +757,24 @@ int main(int argc, char **argv)
 
 	// get image length
 	imglen = lseek(fd, 0, SEEK_END);
+	if (imglen < 0) {
+		perror(img);
+		close(fd);
+		exit(EXIT_FAILURE);
+	}
+
 	lseek (fd, 0, SEEK_SET);
 
 	data = malloc (imglen);
 	if (!data) {
 		perror("out of memory");
+		close (fd);
+		exit(EXIT_FAILURE);
+	}
+
+	if (datsize < 0 || oobsize < 0 || datsize > imglen || (long)datsize + oobsize < 0) {
+		fprintf(stderr, "Error: invalid datsize/oobsize.\n");
+		free(data);
 		close (fd);
 		exit(EXIT_FAILURE);
 	}
@@ -777,7 +790,7 @@ int main(int argc, char **argv)
 			read_nocheck (fd, oob, oobsize);
 			idx += datsize;
 			imglen -= oobsize;
-			len -= datsize + oobsize;
+			len -= (long)datsize + oobsize;
 		}
 
 	} else {

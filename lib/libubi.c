@@ -767,6 +767,8 @@ int ubi_attach(libubi_t desc, const char *node, struct ubi_attach_request *req)
 	r.ubi_num = req->dev_num;
 	r.mtd_num = req->mtd_num;
 	r.vid_hdr_offset = req->vid_hdr_offset;
+	r.disable_fm = req->disable_fm ? 1 : 0;
+	r.need_resv_pool = req->need_resv_pool ? 1 : 0;
 
 	if (req->max_beb_per1024) {
 		/*
@@ -1361,4 +1363,14 @@ int ubi_leb_unmap(int fd, int lnum)
 int ubi_is_mapped(int fd, int lnum)
 {
 	return ioctl(fd, UBI_IOCEBISMAP, &lnum);
+}
+
+int ubi_leb_map(int fd, int lnum)
+{
+	struct ubi_map_req r;
+
+	memset(&r, 0, sizeof(struct ubi_map_req));
+	r.lnum = lnum;
+
+	return ioctl(fd, UBI_IOCEBMAP, &r);
 }

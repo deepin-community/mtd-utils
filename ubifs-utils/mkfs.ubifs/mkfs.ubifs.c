@@ -22,11 +22,18 @@
 
 #define _XOPEN_SOURCE 500 /* For realpath() */
 
-#include "mkfs.ubifs.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <libgen.h>
+#include <getopt.h>
+#include <dirent.h>
 #include <crc32.h>
-#include "common.h"
+#include <uuid.h>
+#include <linux/fs.h>
 #include <sys/types.h>
-#ifndef WITHOUT_XATTR
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#ifdef WITH_XATTR
 #include <sys/xattr.h>
 #endif
 
@@ -35,12 +42,20 @@
 #include <selinux/label.h>
 #endif
 
-#ifndef WITHOUT_ZSTD
+#ifdef WITH_ZSTD
 #include <zstd.h>
 #endif
 
+#include "bitops.h"
 #include "crypto.h"
 #include "fscrypt.h"
+#include "ubifs.h"
+#include "defs.h"
+#include "debug.h"
+#include "key.h"
+#include "compr.h"
+#include "misc.h"
+#include "devtable.h"
 
 /* Size (prime number) of hash table for link counting */
 #define HASH_TABLE_SIZE 10099
@@ -56,7 +71,6 @@
 #ifdef WITH_SELINUX
 #define XATTR_NAME_SELINUX "security.selinux"
 static struct selabel_handle *sehnd;
-static char *secontext;
 #endif
 
 /**
@@ -123,10 +137,7 @@ struct inum_mapping {
  */
 struct ubifs_info info_;
 static struct ubifs_info *c = &info_;
-static libubi_t ubi;
 
-/* Debug levels are: 0 (none), 1 (statistics), 2 (files) ,3 (more details) */
-int debug_level;
 int verbose;
 int yes;
 
@@ -134,9 +145,6 @@ static char *root;
 static int root_len;
 static struct fscrypt_context *root_fctx;
 static struct stat root_st;
-static char *output;
-static int out_fd;
-static int out_ubi;
 static int squash_owner;
 static int do_create_inum_attr;
 static char *context;
@@ -241,8 +249,8 @@ static const char *helptext =
 "-y, --yes                assume the answer is \"yes\" for all questions\n"
 "-v, --verbose            verbose operation\n"
 "-V, --version            display version information\n"
-"-g, --debug=LEVEL        display debug information (0 - none, 1 - statistics,\n"
-"                         2 - files, 3 - more details)\n"
+"-g, --debug=LEVEL        display printing information (0 - none, 1 - error message, \n"
+"                         2 - warning message[default], 3 - notice message, 4 - debug message)\n"
 "-a, --set-inum-attr      create user.image-inode-number extended attribute on files\n"
 "                         added to the image. The attribute will contain the inode\n"
 "                         number the file has in the generated image.\n"
@@ -282,11 +290,6 @@ static const char *helptext =
 "\n"
 "mkfs.ubifs supports building signed images. For this the \"--hash-algo\",\n"
 "\"--auth-key\" and \"--auth-cert\" options have to be specified.\n";
-
-static inline uint8_t *ubifs_branch_hash(struct ubifs_branch *br)
-{
-	return (void *)br + sizeof(*br) + c->key_len;
-}
 
 /**
  * make_path - make a path name from a directory and a name.
@@ -396,62 +399,62 @@ static int validate_options(void)
 {
 	int tmp;
 
-	if (!output)
-		return err_msg("no output file or UBI volume specified");
+	if (!c->dev_name)
+		return errmsg("no output file or UBI volume specified");
 	if (root) {
-		tmp = is_contained(output, root);
+		tmp = is_contained(c->dev_name, root);
 		if (tmp < 0)
-			return err_msg("failed to perform output file root check");
+			return errmsg("failed to perform output file root check");
 		else if (tmp)
-			return err_msg("output file cannot be in the UBIFS root "
+			return errmsg("output file cannot be in the UBIFS root "
 			               "directory");
 	}
 	if (!is_power_of_2(c->min_io_size))
-		return err_msg("min. I/O unit size should be power of 2");
+		return errmsg("min. I/O unit size should be power of 2");
 	if (c->leb_size < c->min_io_size)
-		return err_msg("min. I/O unit cannot be larger than LEB size");
+		return errmsg("min. I/O unit cannot be larger than LEB size");
 	if (c->leb_size < UBIFS_MIN_LEB_SZ)
-		return err_msg("too small LEB size %d, minimum is %d",
+		return errmsg("too small LEB size %d, minimum is %d",
 			       c->leb_size, UBIFS_MIN_LEB_SZ);
 	if (c->leb_size % c->min_io_size)
-		return err_msg("LEB should be multiple of min. I/O units");
+		return errmsg("LEB should be multiple of min. I/O units");
 	if (c->leb_size % 8)
-		return err_msg("LEB size has to be multiple of 8");
+		return errmsg("LEB size has to be multiple of 8");
 	if (c->leb_size > UBIFS_MAX_LEB_SZ)
-		return err_msg("too large LEB size %d, maximum is %d",
+		return errmsg("too large LEB size %d, maximum is %d",
 				c->leb_size, UBIFS_MAX_LEB_SZ);
 	if (c->max_leb_cnt < UBIFS_MIN_LEB_CNT)
-		return err_msg("too low max. count of LEBs, minimum is %d",
+		return errmsg("too low max. count of LEBs, minimum is %d",
 			       UBIFS_MIN_LEB_CNT);
 	if (c->fanout < UBIFS_MIN_FANOUT)
-		return err_msg("too low fanout, minimum is %d",
+		return errmsg("too low fanout, minimum is %d",
 			       UBIFS_MIN_FANOUT);
 	tmp = c->leb_size - UBIFS_IDX_NODE_SZ;
 	tmp /= UBIFS_BRANCH_SZ + UBIFS_MAX_KEY_LEN;
 	if (c->fanout > tmp)
-		return err_msg("too high fanout, maximum is %d", tmp);
+		return errmsg("too high fanout, maximum is %d", tmp);
 	if (c->log_lebs < UBIFS_MIN_LOG_LEBS)
-		return err_msg("too few log LEBs, minimum is %d",
+		return errmsg("too few log LEBs, minimum is %d",
 			       UBIFS_MIN_LOG_LEBS);
 	if (c->log_lebs >= c->max_leb_cnt - UBIFS_MIN_LEB_CNT)
-		return err_msg("too many log LEBs, maximum is %d",
+		return errmsg("too many log LEBs, maximum is %d",
 			       c->max_leb_cnt - UBIFS_MIN_LEB_CNT);
 	if (c->orph_lebs < UBIFS_MIN_ORPH_LEBS)
-		return err_msg("too few orphan LEBs, minimum is %d",
+		return errmsg("too few orphan LEBs, minimum is %d",
 			       UBIFS_MIN_ORPH_LEBS);
 	if (c->orph_lebs >= c->max_leb_cnt - UBIFS_MIN_LEB_CNT)
-		return err_msg("too many orphan LEBs, maximum is %d",
+		return errmsg("too many orphan LEBs, maximum is %d",
 			       c->max_leb_cnt - UBIFS_MIN_LEB_CNT);
 	tmp = UBIFS_SB_LEBS + UBIFS_MST_LEBS + c->log_lebs + c->lpt_lebs;
 	tmp += c->orph_lebs + 4;
 	if (tmp > c->max_leb_cnt)
-		return err_msg("too low max. count of LEBs, expected at "
+		return errmsg("too low max. count of LEBs, expected at "
 			       "least %d", tmp);
 	tmp = calc_min_log_lebs(c->max_bud_bytes);
 	if (c->log_lebs < calc_min_log_lebs(c->max_bud_bytes))
-		return err_msg("too few log LEBs, expected at least %d", tmp);
+		return errmsg("too few log LEBs, expected at least %d", tmp);
 	if (c->rp_size >= ((long long)c->leb_size * c->max_leb_cnt) / 2)
-		return err_msg("too much reserved space %lld", c->rp_size);
+		return errmsg("too much reserved space %lld", c->rp_size);
 	return 0;
 }
 
@@ -497,40 +500,18 @@ static long long get_bytes(const char *str)
 	long long bytes = strtoull(str, &endp, 0);
 
 	if (endp == str || bytes < 0)
-		return err_msg("incorrect amount of bytes: \"%s\"", str);
+		return errmsg("incorrect amount of bytes: \"%s\"", str);
 
 	if (*endp != '\0') {
 		int mult = get_multiplier(endp);
 
 		if (mult == -1)
-			return err_msg("bad size specifier: \"%s\" - "
+			return errmsg("bad size specifier: \"%s\" - "
 				       "should be 'KiB', 'MiB' or 'GiB'", endp);
 		bytes *= mult;
 	}
 
 	return bytes;
-}
-/**
- * open_ubi - open the UBI volume.
- * @node: name of the UBI volume character device to fetch information about
- *
- * Returns %0 in case of success and %-1 in case of failure
- */
-static int open_ubi(const char *node)
-{
-	struct stat st;
-
-	if (stat(node, &st) || !S_ISCHR(st.st_mode))
-		return -1;
-
-	ubi = libubi_open();
-	if (!ubi)
-		return -1;
-	if (ubi_get_vol_info(ubi, node, &c->vi))
-		return -1;
-	if (ubi_get_dev_info1(ubi, c->vi.dev_num, &c->di))
-		return -1;
-	return 0;
 }
 
 static void select_default_compr(void)
@@ -540,10 +521,12 @@ static void select_default_compr(void)
 		return;
 	}
 
-#ifdef WITHOUT_LZO
+#ifdef WITH_LZO
+	c->default_compr = UBIFS_COMPR_LZO;
+#elif defined(WITH_ZLIB)
 	c->default_compr = UBIFS_COMPR_ZLIB;
 #else
-	c->default_compr = UBIFS_COMPR_LZO;
+	c->default_compr = UBIFS_COMPR_NONE;
 #endif
 }
 
@@ -555,7 +538,7 @@ static int get_options(int argc, char**argv)
 	struct stat st;
 	char *endp;
 #ifdef WITH_CRYPTO
-	const char *cipher_name;
+	const char *cipher_name = NULL;
 #endif
 
 	c->fanout = 8;
@@ -595,31 +578,31 @@ static int get_options(int argc, char**argv)
 
 			/* Make sure the root directory exists */
 			if (stat(root, &st))
-				return sys_err_msg("bad root directory '%s'",
+				return sys_errmsg("bad root directory '%s'",
 						   root);
 			break;
 		case 'm':
 			c->min_io_size = get_bytes(optarg);
 			if (c->min_io_size <= 0)
-				return err_msg("bad min. I/O size");
+				return errmsg("bad min. I/O size");
 			break;
 		case 'e':
 			c->leb_size = get_bytes(optarg);
 			if (c->leb_size <= 0)
-				return err_msg("bad LEB size");
+				return errmsg("bad LEB size");
 			break;
 		case 'c':
 			c->max_leb_cnt = get_bytes(optarg);
 			if (c->max_leb_cnt <= 0)
-				return err_msg("bad maximum LEB count");
+				return errmsg("bad maximum LEB count");
 			break;
 		case 'o':
-			output = xstrdup(optarg);
+			c->dev_name = xstrdup(optarg);
 			break;
 		case 'D':
 			tbl_file = optarg;
 			if (stat(tbl_file, &st) < 0)
-				return sys_err_msg("bad device table file '%s'",
+				return sys_errmsg("bad device table file '%s'",
 						   tbl_file);
 			break;
 		case 'y':
@@ -642,16 +625,16 @@ static int get_options(int argc, char**argv)
 			common_print_version();
 			exit(EXIT_SUCCESS);
 		case 'g':
-			debug_level = strtol(optarg, &endp, 0);
+			c->debug_level = strtol(optarg, &endp, 0);
 			if (*endp != '\0' || endp == optarg ||
-			    debug_level < 0 || debug_level > 3)
-				return err_msg("bad debugging level '%s'",
+			    c->debug_level < 0 || c->debug_level > DEBUG_LEVEL)
+				return errmsg("bad debugging level '%s'",
 					       optarg);
 			break;
 		case 'f':
 			c->fanout = strtol(optarg, &endp, 0);
 			if (*endp != '\0' || endp == optarg || c->fanout <= 0)
-				return err_msg("bad fanout %s", optarg);
+				return errmsg("bad fanout %s", optarg);
 			break;
 		case 'F':
 			c->space_fixup = 1;
@@ -659,14 +642,14 @@ static int get_options(int argc, char**argv)
 		case 'l':
 			c->log_lebs = strtol(optarg, &endp, 0);
 			if (*endp != '\0' || endp == optarg || c->log_lebs <= 0)
-				return err_msg("bad count of log LEBs '%s'",
+				return errmsg("bad count of log LEBs '%s'",
 					       optarg);
 			break;
 		case 'p':
 			c->orph_lebs = strtol(optarg, &endp, 0);
 			if (*endp != '\0' || endp == optarg ||
 			    c->orph_lebs <= 0)
-				return err_msg("bad orphan LEB count '%s'",
+				return errmsg("bad orphan LEB count '%s'",
 					       optarg);
 			break;
 		case 'k':
@@ -677,48 +660,52 @@ static int get_options(int argc, char**argv)
 				c->key_hash = key_test_hash;
 				c->key_hash_type = UBIFS_KEY_HASH_TEST;
 			} else
-				return err_msg("bad key hash");
+				return errmsg("bad key hash");
 			break;
 		case 'x':
 			if (strcmp(optarg, "none") == 0)
 				c->default_compr = UBIFS_COMPR_NONE;
+#ifdef WITH_ZLIB
 			else if (strcmp(optarg, "zlib") == 0)
 				c->default_compr = UBIFS_COMPR_ZLIB;
-#ifndef WITHOUT_ZSTD
+#endif
+#ifdef WITH_ZSTD
 			else if (strcmp(optarg, "zstd") == 0)
 				c->default_compr = UBIFS_COMPR_ZSTD;
 #endif
-#ifndef WITHOUT_LZO
+#ifdef WITH_LZO
+			else if (strcmp(optarg, "lzo") == 0)
+				c->default_compr = UBIFS_COMPR_LZO;
+#endif
+#if defined(WITH_LZO) && defined(WITH_ZLIB)
 			else if (strcmp(optarg, "favor_lzo") == 0) {
 				c->default_compr = UBIFS_COMPR_LZO;
 				c->favor_lzo = 1;
-			} else if (strcmp(optarg, "lzo") == 0) {
-				c->default_compr = UBIFS_COMPR_LZO;
 			}
 #endif
 			else
-				return err_msg("bad compressor name");
+				return errmsg("bad compressor name");
 			break;
 		case 'X':
-#ifdef WITHOUT_LZO
-			return err_msg("built without LZO support");
+#if !defined(WITH_LZO) && !defined(WITH_ZLIB)
+			return errmsg("built without LZO or ZLIB support");
 #else
 			c->favor_percent = strtol(optarg, &endp, 0);
 			if (*endp != '\0' || endp == optarg ||
 			    c->favor_percent <= 0 || c->favor_percent >= 100)
-				return err_msg("bad favor LZO percent '%s'",
+				return errmsg("bad favor LZO percent '%s'",
 					       optarg);
 #endif
 			break;
 		case 'j':
 			c->max_bud_bytes = get_bytes(optarg);
 			if (c->max_bud_bytes <= 0)
-				return err_msg("bad maximum amount of buds");
+				return errmsg("bad maximum amount of buds");
 			break;
 		case 'R':
 			c->rp_size = get_bytes(optarg);
 			if (c->rp_size < 0)
-				return err_msg("bad reserved bytes count");
+				return errmsg("bad reserved bytes count");
 			break;
 		case 'U':
 			squash_owner = 1;
@@ -731,23 +718,24 @@ static int get_options(int argc, char**argv)
 			context_len = strlen(optarg);
 			context = (char *) xmalloc(context_len + 1);
 			if (!context)
-				return err_msg("xmalloc failed\n");
+				return errmsg("xmalloc failed\n");
 			memcpy(context, optarg, context_len);
+			context[context_len] = '\0';
 
 			/* Make sure root directory exists */
 			if (stat(context, &context_st))
-				return sys_err_msg("bad file context %s\n",
+				return sys_errmsg("bad file context %s\n",
 								   context);
 			break;
 		case 'K':
 			if (key_file) {
-				return err_msg("key file specified more than once");
+				return errmsg("key file specified more than once");
 			}
 			key_file = optarg;
 			break;
 		case 'b':
 			if (key_desc) {
-				return err_msg("key descriptor specified more than once");
+				return errmsg("key descriptor specified more than once");
 			}
 			key_desc = optarg;
 			break;
@@ -798,20 +786,20 @@ static int get_options(int argc, char**argv)
 		case HASH_ALGO_OPTION:
 		case AUTH_KEY_OPTION:
 		case AUTH_CERT_OPTION:
-			return err_msg("mkfs.ubifs was built without crypto support.");
+			return errmsg("mkfs.ubifs was built without crypto support.");
 #endif
 		}
 	}
 
-	if (optind != argc && !output)
-		output = xstrdup(argv[optind]);
+	if (optind != argc && !c->dev_name)
+		c->dev_name = xstrdup(argv[optind]);
 
-	if (!output)
-		return err_msg("not output device or file specified");
+	if (!c->dev_name)
+		return errmsg("not output device or file specified");
 
-	out_ubi = !open_ubi(output);
+	open_ubi(c, c->dev_name);
 
-	if (out_ubi) {
+	if (c->libubi) {
 		c->min_io_size = c->di.min_io_size;
 		c->leb_size = c->vi.leb_size;
 		if (c->max_leb_cnt == -1)
@@ -820,7 +808,7 @@ static int get_options(int argc, char**argv)
 	if (key_file || key_desc) {
 #ifdef WITH_CRYPTO
 		if (!key_file)
-			return err_msg("no key file specified");
+			return errmsg("no key file specified");
 
 		c->double_hash = 1;
 		c->encrypted = 1;
@@ -833,7 +821,7 @@ static int get_options(int argc, char**argv)
 		if (!root_fctx)
 			return -1;
 #else
-		return err_msg("mkfs.ubifs was built without crypto support.");
+		return errmsg("mkfs.ubifs was built without crypto support.");
 #endif
 	}
 
@@ -841,14 +829,14 @@ static int get_options(int argc, char**argv)
 		select_default_compr();
 
 	if (c->min_io_size == -1)
-		return err_msg("min. I/O unit was not specified "
+		return errmsg("min. I/O unit was not specified "
 			       "(use -h for help)");
 
 	if (c->leb_size == -1)
-		return err_msg("LEB size was not specified (use -h for help)");
+		return errmsg("LEB size was not specified (use -h for help)");
 
 	if (c->max_leb_cnt == -1)
-		return err_msg("Maximum count of LEBs was not specified "
+		return errmsg("Maximum count of LEBs was not specified "
 			       "(use -h for help)");
 
 	if (c->max_bud_bytes == -1) {
@@ -889,7 +877,7 @@ static int get_options(int argc, char**argv)
 		printf("\tmin_io_size:  %d\n", c->min_io_size);
 		printf("\tleb_size:     %d\n", c->leb_size);
 		printf("\tmax_leb_cnt:  %d\n", c->max_leb_cnt);
-		printf("\toutput:       %s\n", output);
+		printf("\toutput:       %s\n", c->dev_name);
 		printf("\tjrn_size:     %llu\n", c->max_bud_bytes);
 		printf("\treserved:     %llu\n", c->rp_size);
 		switch (c->default_compr) {
@@ -915,52 +903,7 @@ static int get_options(int argc, char**argv)
 		return -1;
 
 	if (tbl_file && parse_devtable(tbl_file))
-		return err_msg("cannot parse device table file '%s'", tbl_file);
-
-	return 0;
-}
-
-/**
- * prepare_node - fill in the common header.
- * @node: node
- * @len: node length
- */
-static void prepare_node(void *node, int len)
-{
-	uint32_t crc;
-	struct ubifs_ch *ch = node;
-
-	ch->magic = cpu_to_le32(UBIFS_NODE_MAGIC);
-	ch->len = cpu_to_le32(len);
-	ch->group_type = UBIFS_NO_NODE_GROUP;
-	ch->sqnum = cpu_to_le64(++c->max_sqnum);
-	ch->padding[0] = ch->padding[1] = 0;
-	crc = mtd_crc32(UBIFS_CRC32_INIT, node + 8, len - 8);
-	ch->crc = cpu_to_le32(crc);
-}
-
-/**
- * write_leb - copy the image of a LEB to the output target.
- * @lnum: LEB number
- * @len: length of data in the buffer
- * @buf: buffer (must be at least c->leb_size bytes)
- */
-int write_leb(int lnum, int len, void *buf)
-{
-	off_t pos = (off_t)lnum * c->leb_size;
-
-	dbg_msg(3, "LEB %d len %d", lnum, len);
-	memset(buf + len, 0xff, c->leb_size - len);
-	if (out_ubi)
-		if (ubi_leb_change_start(ubi, out_fd, lnum, c->leb_size))
-			return sys_err_msg("ubi_leb_change_start failed");
-
-	if (lseek(out_fd, pos, SEEK_SET) != pos)
-		return sys_err_msg("lseek failed seeking %lld", (long long)pos);
-
-	if (write(out_fd, buf, c->leb_size) != c->leb_size)
-		return sys_err_msg("write failed writing %d bytes at pos %lld",
-				   c->leb_size, (long long)pos);
+		return errmsg("cannot parse device table file '%s'", tbl_file);
 
 	return 0;
 }
@@ -971,46 +914,8 @@ int write_leb(int lnum, int len, void *buf)
  */
 static int write_empty_leb(int lnum)
 {
-	return write_leb(lnum, 0, leb_buf);
-}
-
-/**
- * do_pad - pad a buffer to the minimum I/O size.
- * @buf: buffer
- * @len: buffer length
- */
-static int do_pad(void *buf, int len)
-{
-	int pad_len, alen = ALIGN(len, 8), wlen = ALIGN(alen, c->min_io_size);
-	uint32_t crc;
-
-	memset(buf + len, 0xff, alen - len);
-	pad_len = wlen - alen;
-	dbg_msg(3, "len %d pad_len %d", len, pad_len);
-	buf += alen;
-	if (pad_len >= (int)UBIFS_PAD_NODE_SZ) {
-		struct ubifs_ch *ch = buf;
-		struct ubifs_pad_node *pad_node = buf;
-
-		ch->magic      = cpu_to_le32(UBIFS_NODE_MAGIC);
-		ch->node_type  = UBIFS_PAD_NODE;
-		ch->group_type = UBIFS_NO_NODE_GROUP;
-		ch->padding[0] = ch->padding[1] = 0;
-		ch->sqnum      = cpu_to_le64(0);
-		ch->len        = cpu_to_le32(UBIFS_PAD_NODE_SZ);
-
-		pad_len -= UBIFS_PAD_NODE_SZ;
-		pad_node->pad_len = cpu_to_le32(pad_len);
-
-		crc = mtd_crc32(UBIFS_CRC32_INIT, buf + 8,
-				  UBIFS_PAD_NODE_SZ - 8);
-		ch->crc = cpu_to_le32(crc);
-
-		memset(buf + UBIFS_PAD_NODE_SZ, 0, pad_len);
-	} else if (pad_len > 0)
-		memset(buf, UBIFS_PADDING_BYTE, pad_len);
-
-	return wlen;
+	memset(leb_buf, 0xff, c->leb_size);
+	return ubifs_leb_change(c, lnum, leb_buf, c->leb_size);
 }
 
 /**
@@ -1021,13 +926,16 @@ static int do_pad(void *buf, int len)
  */
 static int write_node(void *node, int len, int lnum)
 {
-	prepare_node(node, len);
+	int alen = ALIGN(len, 8), wlen = ALIGN(len, c->min_io_size);
 
+	ubifs_prepare_node(c, node, len, 0);
 	memcpy(leb_buf, node, len);
+	memset(leb_buf + len, 0xff, alen - len);
+	ubifs_pad(c, leb_buf + alen, wlen - alen);
 
-	len = do_pad(leb_buf, len);
+	memset(leb_buf + wlen, 0xff, c->leb_size - wlen);
 
-	return write_leb(lnum, len, leb_buf);
+	return ubifs_leb_change(c, lnum, leb_buf, c->leb_size);
 }
 
 /**
@@ -1074,8 +982,7 @@ static void set_lprops(int lnum, int offs, int flags)
 
 	free = c->leb_size - ALIGN(offs, a);
 	dirty = c->leb_size - free - ALIGN(offs, 8);
-	dbg_msg(3, "LEB %d free %d dirty %d flags %d", lnum, free, dirty,
-		flags);
+	pr_debug("LEB %d free %d dirty %d flags %d\n", lnum, free, dirty, flags);
 	if (i < c->main_lebs) {
 		c->lpt[i].free = free;
 		c->lpt[i].dirty = dirty;
@@ -1110,7 +1017,7 @@ static int add_to_index(union ubifs_key *key, char *name, int name_len,
 {
 	struct idx_entry *e;
 
-	dbg_msg(3, "LEB %d offs %d len %d", lnum, offs, len);
+	pr_debug("LEB %d offs %d len %d\n", lnum, offs, len);
 	e = xmalloc(sizeof(struct idx_entry));
 	e->next = NULL;
 	e->prev = idx_list_last;
@@ -1140,8 +1047,10 @@ static int flush_nodes(void)
 
 	if (!head_offs)
 		return 0;
-	len = do_pad(leb_buf, head_offs);
-	err = write_leb(head_lnum, len, leb_buf);
+	len = ALIGN(head_offs, c->min_io_size);
+	ubifs_pad(c, leb_buf + head_offs, len - head_offs);
+	memset(leb_buf + len, 0xff, c->leb_size - len);
+	err = ubifs_leb_change(c, head_lnum, leb_buf, c->leb_size);
 	if (err)
 		return err;
 	set_lprops(head_lnum, head_offs, head_flags);
@@ -1179,19 +1088,19 @@ static int reserve_space(int len, int *lnum, int *offs)
  */
 static int add_node(union ubifs_key *key, char *name, int name_len, void *node, int len)
 {
-	int err, lnum, offs, type = key_type(key);
+	int err, lnum, offs, type = key_type(c, key);
 	uint8_t hash[UBIFS_MAX_HASH_LEN];
 
 	if (type == UBIFS_DENT_KEY || type == UBIFS_XENT_KEY) {
 		if (!name)
-			return err_msg("Directory entry or xattr "
+			return errmsg("Directory entry or xattr "
 					"without name!");
 	} else {
 		if (name)
-			return err_msg("Name given for non dir/xattr node!");
+			return errmsg("Name given for non dir/xattr node!");
 	}
 
-	prepare_node(node, len);
+	ubifs_prepare_node(c, node, len, 0);
 
 	err = reserve_space(len, &lnum, &offs);
 	if (err)
@@ -1200,7 +1109,7 @@ static int add_node(union ubifs_key *key, char *name, int name_len, void *node, 
 	memcpy(leb_buf + offs, node, len);
 	memset(leb_buf + offs + len, 0xff, ALIGN(len, 8) - len);
 
-	ubifs_node_calc_hash(node, hash);
+	ubifs_node_calc_hash(c, node, hash);
 
 	add_to_index(key, name, name_len, lnum, offs, len, hash);
 
@@ -1213,41 +1122,43 @@ static int add_xattr(struct ubifs_ino_node *host_ino, struct stat *st,
 {
 	struct ubifs_ino_node *ino;
 	struct ubifs_dent_node *xent;
-	struct qstr nm;
+	struct fscrypt_name nm;
+	char *tmp_name;
 	union ubifs_key xkey, nkey;
 	int len, ret;
 
-	nm.len = strlen(name);
-	nm.name = xmalloc(nm.len + 1);
-	memcpy(nm.name, name, nm.len + 1);
+	fname_len(&nm) = strlen(name);
+	tmp_name = xmalloc(fname_len(&nm) + 1);
+	memcpy(tmp_name, name, fname_len(&nm) + 1);
+	fname_name(&nm) = tmp_name;
 
 	host_ino->xattr_cnt++;
-	host_ino->xattr_size += CALC_DENT_SIZE(nm.len);
+	host_ino->xattr_size += CALC_DENT_SIZE(fname_len(&nm));
 	host_ino->xattr_size += CALC_XATTR_BYTES(data_len);
-	host_ino->xattr_names += nm.len;
+	host_ino->xattr_names += fname_len(&nm);
 
-	xent = xzalloc(sizeof(*xent) + nm.len + 1);
+	xent = xzalloc(sizeof(*xent) + fname_len(&nm) + 1);
 	ino = xzalloc(sizeof(*ino) + data_len);
 
 	xent_key_init(c, &xkey, inum, &nm);
 	xent->ch.node_type = UBIFS_XENT_NODE;
-	key_write(&xkey, &xent->key);
+	key_write(c, &xkey, &xent->key);
 
-	len = UBIFS_XENT_NODE_SZ + nm.len + 1;
+	len = UBIFS_XENT_NODE_SZ + fname_len(&nm) + 1;
 
 	xent->ch.len = len;
 	xent->padding1 = 0;
-	xent->type = UBIFS_ITYPE_DIR;
-	xent->nlen = cpu_to_le16(nm.len);
+	xent->type = UBIFS_ITYPE_REG;
+	xent->nlen = cpu_to_le16(fname_len(&nm));
 
-	memcpy(xent->name, nm.name, nm.len + 1);
+	memcpy(xent->name, fname_name(&nm), fname_len(&nm) + 1);
 
 	inum = ++c->highest_inum;
 	creat_sqnum = ++c->max_sqnum;
 
 	xent->inum = cpu_to_le64(inum);
 
-	ret = add_node(&xkey, nm.name, nm.len, xent, len);
+	ret = add_node(&xkey, tmp_name, fname_len(&nm), xent, len);
 	if (ret)
 		goto out;
 
@@ -1268,8 +1179,8 @@ static int add_xattr(struct ubifs_ino_node *host_ino, struct stat *st,
 	ino->compr_type = cpu_to_le16(c->default_compr);
 	ino->ch.node_type = UBIFS_INO_NODE;
 
-	ino_key_init(&nkey, inum);
-	key_write(&nkey, &ino->key);
+	ino_key_init(c, &nkey, inum);
+	key_write(c, &nkey, &ino->key);
 
 	ino->size       = cpu_to_le64(data_len);
 	ino->mode       = cpu_to_le32(S_IFREG);
@@ -1288,7 +1199,7 @@ out:
 	return ret;
 }
 
-#ifdef WITHOUT_XATTR
+#ifndef WITH_XATTR
 static inline int create_inum_attr(ino_t inum, const char *name)
 {
 	(void)inum;
@@ -1341,7 +1252,7 @@ static int inode_add_xattr(struct ubifs_ino_node *host_ino,
 		if (errno == ENOENT || errno == EOPNOTSUPP)
 			return 0;
 
-		sys_err_msg("llistxattr failed on %s", path_name);
+		sys_errmsg("llistxattr failed on %s", path_name);
 
 		return len;
 	}
@@ -1353,7 +1264,7 @@ static int inode_add_xattr(struct ubifs_ino_node *host_ino,
 
 	len = llistxattr(path_name, buf, len);
 	if (len < 0) {
-		sys_err_msg("llistxattr failed on %s", path_name);
+		sys_errmsg("llistxattr failed on %s", path_name);
 		goto out_free;
 	}
 
@@ -1367,7 +1278,7 @@ static int inode_add_xattr(struct ubifs_ino_node *host_ino,
 
 		attrsize = lgetxattr(path_name, name, attrbuf, sizeof(attrbuf) - 1);
 		if (attrsize < 0) {
-			sys_err_msg("lgetxattr failed on %s", path_name);
+			sys_errmsg("lgetxattr failed on %s", path_name);
 			goto out_free;
 		}
 
@@ -1377,7 +1288,7 @@ static int inode_add_xattr(struct ubifs_ino_node *host_ino,
 			inum_from_xattr = strtoull(attrbuf, NULL, 10);
 			if (inum != inum_from_xattr) {
 				errno = EINVAL;
-				sys_err_msg("calculated inum (%llu) doesn't match inum from xattr (%llu) size (%zd) on %s",
+				sys_errmsg("calculated inum (%llu) doesn't match inum from xattr (%llu) size (%zd) on %s",
 					    (unsigned long long)inum,
 					    (unsigned long long)inum_from_xattr,
 					    attrsize,
@@ -1387,6 +1298,15 @@ static int inode_add_xattr(struct ubifs_ino_node *host_ino,
 
 			continue;
 		}
+
+#ifdef WITH_SELINUX
+		/*
+		  Ignore selinux attributes if we have a label file, they are
+		  instead provided by inode_add_selinux_xattr.
+		 */
+		if (!strcmp(name, XATTR_NAME_SELINUX) && context && sehnd)
+			continue;
+#endif
 
 		ret = add_xattr(host_ino, st, inum, name, attrbuf, attrsize);
 		if (ret < 0)
@@ -1412,12 +1332,10 @@ static int inode_add_selinux_xattr(struct ubifs_ino_node *host_ino,
 	char *sepath = NULL;
 	char *name;
 	unsigned int con_size;
+	char *secontext;
 
-	if (!context || !sehnd) {
-		secontext = NULL;
-		con_size = 0;
+	if (!context || !sehnd)
 		return 0;
-	}
 
 	if (path_name[strlen(root)] == '/')
 		sepath = strdup(&path_name[strlen(root)]);
@@ -1426,24 +1344,24 @@ static int inode_add_selinux_xattr(struct ubifs_ino_node *host_ino,
 		sepath = NULL;
 
 	if (!sepath)
-		return sys_err_msg("could not get sepath\n");
+		return sys_errmsg("could not get sepath\n");
 
 	if (selabel_lookup(sehnd, &secontext, sepath, st->st_mode) < 0) {
 		/* Failed to lookup context, assume unlabeled */
 		secontext = strdup("system_u:object_r:unlabeled_t:s0");
-		dbg_msg(2, "missing context: %s\t%s\t%d\n", secontext, sepath,
-				st->st_mode);
+		pr_debug("missing context: %s\t%s\t%d\n", secontext, sepath,
+			 st->st_mode);
 	}
 
-	dbg_msg(2, "appling selinux context on sepath=%s, secontext=%s\n",
-			sepath, secontext);
+	pr_debug("appling selinux context on sepath=%s, secontext=%s\n",
+		 sepath, secontext);
 	free(sepath);
 	con_size = strlen(secontext) + 1;
 	name = strdup(XATTR_NAME_SELINUX);
 
 	ret = add_xattr(host_ino, st, inum, name, secontext, con_size);
 	if (ret < 0)
-		dbg_msg(2, "add_xattr failed %d\n", ret);
+		pr_debug("add_xattr failed %d\n", ret);
 	return ret;
 }
 
@@ -1555,9 +1473,9 @@ static int add_inode(struct stat *st, ino_t inum, void *data,
 		use_flags |= UBIFS_CRYPT_FL;
 	memset(ino, 0, UBIFS_INO_NODE_SZ);
 
-	ino_key_init(&key, inum);
+	ino_key_init(c, &key, inum);
 	ino->ch.node_type = UBIFS_INO_NODE;
-	key_write(&key, &ino->key);
+	key_write(c, &key, &ino->key);
 	ino->creat_sqnum = cpu_to_le64(creat_sqnum);
 	ino->size       = cpu_to_le64(st->st_size);
 	ino->nlink      = cpu_to_le32(st->st_nlink);
@@ -1582,7 +1500,7 @@ static int add_inode(struct stat *st, ino_t inum, void *data,
 		} else {
 			/* TODO: what about device files? */
 			if (!S_ISLNK(st->st_mode))
-				return err_msg("Expected symlink");
+				return errmsg("Expected symlink");
 
 			ret = encrypt_symlink(&ino->data, data, data_len, fctx);
 			if (ret < 0)
@@ -1594,11 +1512,11 @@ static int add_inode(struct stat *st, ino_t inum, void *data,
 	len = UBIFS_INO_NODE_SZ + data_len;
 
 	if (xattr_path) {
-#ifdef WITH_SELINUX
 		ret = inode_add_selinux_xattr(ino, xattr_path, st, inum);
-#else
+		if (ret < 0)
+			return ret;
+
 		ret = inode_add_xattr(ino, xattr_path, st, inum);
-#endif
 		if (ret < 0)
 			return ret;
 	}
@@ -1637,7 +1555,7 @@ static int add_dir_inode(const char *path_name, DIR *dir, ino_t inum, loff_t siz
 	if (dir) {
 		fd = dirfd(dir);
 		if (fd == -1)
-			return sys_err_msg("dirfd failed");
+			return sys_errmsg("dirfd failed");
 		if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == -1)
 			flags = 0;
 	}
@@ -1675,9 +1593,9 @@ static int add_symlink_inode(const char *path_name, struct stat *st, ino_t inum,
 	/* Take the symlink as is */
 	len = readlink(path_name, buf, UBIFS_MAX_INO_DATA + 1);
 	if (len <= 0)
-		return sys_err_msg("readlink failed for %s", path_name);
+		return sys_errmsg("readlink failed for %s", path_name);
 	if (len > UBIFS_MAX_INO_DATA)
-		return err_msg("symlink too long for %s", path_name);
+		return errmsg("symlink too long for %s", path_name);
 
 	return add_inode(st, inum, buf, len, flags, path_name, fctx);
 }
@@ -1698,19 +1616,22 @@ static void set_dent_cookie(struct ubifs_dent_node *dent)
  * @name: directory entry name
  * @inum: target inode number of the directory entry
  * @type: type of the target inode
+ * @kname_len: the length of name stored in the directory entry node is
+ *	       returned here
  */
 static int add_dent_node(ino_t dir_inum, const char *name, ino_t inum,
-			 unsigned char type, struct fscrypt_context *fctx)
+			 unsigned char type, struct fscrypt_context *fctx,
+			 int *kname_len)
 {
 	struct ubifs_dent_node *dent = node_buf;
 	union ubifs_key key;
 	struct qstr dname;
+	struct fscrypt_name nm;
 	char *kname;
-	int kname_len;
 	int len;
 
-	dbg_msg(3, "%s ino %lu type %u dir ino %lu", name, (unsigned long)inum,
-		(unsigned int)type, (unsigned long)dir_inum);
+	pr_debug("%s ino %lu type %u dir ino %lu\n", name, (unsigned long)inum,
+		 (unsigned int)type, (unsigned long)dir_inum);
 	memset(dent, 0, UBIFS_DENT_NODE_SZ);
 
 	dname.name = (void *)name;
@@ -1724,10 +1645,10 @@ static int add_dent_node(ino_t dir_inum, const char *name, ino_t inum,
 	set_dent_cookie(dent);
 
 	if (!fctx) {
-		kname_len = dname.len;
+		*kname_len = dname.len;
 		kname = strdup(name);
 		if (!kname)
-			return err_msg("cannot allocate memory");
+			return errmsg("cannot allocate memory");
 	} else {
 		unsigned int max_namelen = UBIFS_MAX_NLEN;
 		int ret;
@@ -1740,18 +1661,20 @@ static int add_dent_node(ino_t dir_inum, const char *name, ino_t inum,
 		if (ret < 0)
 			return ret;
 
-		kname_len = ret;
+		*kname_len = ret;
 	}
 
-	dent_key_init(c, &key, dir_inum, kname, kname_len);
-	dent->nlen = cpu_to_le16(kname_len);
-	memcpy(dent->name, kname, kname_len);
-	dent->name[kname_len] = '\0';
-	len = UBIFS_DENT_NODE_SZ + kname_len + 1;
+	fname_name(&nm) = kname;
+	fname_len(&nm) = *kname_len;
+	dent_key_init(c, &key, dir_inum, &nm);
+	dent->nlen = cpu_to_le16(*kname_len);
+	memcpy(dent->name, kname, *kname_len);
+	dent->name[*kname_len] = '\0';
+	len = UBIFS_DENT_NODE_SZ + *kname_len + 1;
 
-	key_write(&key, dent->key);
+	key_write(c, &key, dent->key);
 
-	return add_node(&key, kname, kname_len, dent, len);
+	return add_node(&key, kname, *kname_len, dent, len);
 }
 
 /**
@@ -1820,7 +1743,7 @@ static int add_file(const char *path_name, struct stat *st, ino_t inum,
 
 	fd = open(path_name, O_RDONLY | O_LARGEFILE);
 	if (fd == -1)
-		return sys_err_msg("failed to open file '%s'", path_name);
+		return sys_errmsg("failed to open file '%s'", path_name);
 	do {
 		/* Read next block */
 		bytes_read = 0;
@@ -1828,7 +1751,7 @@ static int add_file(const char *path_name, struct stat *st, ino_t inum,
 			ret = read(fd, buf + bytes_read,
 				   UBIFS_BLOCK_SIZE - bytes_read);
 			if (ret == -1) {
-				sys_err_msg("failed to read file '%s'",
+				sys_errmsg("failed to read file '%s'",
 					    path_name);
 				close(fd);
 				return 1;
@@ -1845,16 +1768,18 @@ static int add_file(const char *path_name, struct stat *st, ino_t inum,
 		}
 		/* Make data node */
 		memset(dn, 0, UBIFS_DATA_NODE_SZ);
-		data_key_init(&key, inum, block_no);
+		data_key_init(c, &key, inum, block_no);
 		dn->ch.node_type = UBIFS_DATA_NODE;
-		key_write(&key, &dn->key);
+		key_write(c, &key, &dn->key);
 		out_len = NODE_BUFFER_SIZE - UBIFS_DATA_NODE_SZ;
 		if (c->default_compr == UBIFS_COMPR_NONE &&
 		    !c->encrypted && (flags & FS_COMPR_FL))
-#ifdef WITHOUT_LZO
+#ifdef WITH_LZO
+			use_compr = UBIFS_COMPR_LZO;
+#elif defined(WITH_ZLIB)
 			use_compr = UBIFS_COMPR_ZLIB;
 #else
-			use_compr = UBIFS_COMPR_LZO;
+			use_compr = UBIFS_COMPR_NONE;
 #endif
 		else
 			use_compr = c->default_compr;
@@ -1886,9 +1811,9 @@ static int add_file(const char *path_name, struct stat *st, ino_t inum,
 	} while (ret != 0);
 
 	if (close(fd) == -1)
-		return sys_err_msg("failed to close file '%s'", path_name);
+		return sys_errmsg("failed to close file '%s'", path_name);
 	if (file_size != st->st_size)
-		return err_msg("file size changed during writing file '%s'",
+		return errmsg("file size changed during writing file '%s'",
 			       path_name);
 
 	return add_inode(st, inum, NULL, 0, flags, path_name, fctx);
@@ -1909,17 +1834,17 @@ static int add_non_dir(const char *path_name, ino_t *inum, unsigned int nlink,
 {
 	int fd, flags = 0;
 
-	dbg_msg(2, "%s", path_name);
+	pr_debug("%s\n", path_name);
 
 	if (S_ISREG(st->st_mode)) {
 		fd = open(path_name, O_RDONLY);
 		if (fd == -1)
-			return sys_err_msg("failed to open file '%s'",
+			return sys_errmsg("failed to open file '%s'",
 					   path_name);
 		if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == -1)
 			flags = 0;
 		if (close(fd) == -1)
-			return sys_err_msg("failed to close file '%s'",
+			return sys_errmsg("failed to close file '%s'",
 					   path_name);
 		*type = UBIFS_ITYPE_REG;
 	} else if (S_ISCHR(st->st_mode))
@@ -1933,7 +1858,7 @@ static int add_non_dir(const char *path_name, ino_t *inum, unsigned int nlink,
 	else if (S_ISFIFO(st->st_mode))
 		*type = UBIFS_ITYPE_FIFO;
 	else
-		return err_msg("file '%s' has unknown inode type", path_name);
+		return errmsg("file '%s' has unknown inode type", path_name);
 
 	if (nlink)
 		st->st_nlink = nlink;
@@ -1947,7 +1872,7 @@ static int add_non_dir(const char *path_name, ino_t *inum, unsigned int nlink,
 
 		im = lookup_inum_mapping(st->st_dev, st->st_ino);
 		if (!im)
-			return err_msg("out of memory");
+			return errmsg("out of memory");
 		if (im->use_nlink == 0) {
 			/* New entry */
 			im->use_inum = *inum;
@@ -1982,7 +1907,7 @@ static int add_non_dir(const char *path_name, ino_t *inum, unsigned int nlink,
 	if (S_ISFIFO(st->st_mode))
 		return add_inode(st, *inum, NULL, 0, flags, NULL, NULL);
 
-	return err_msg("file '%s' has unknown inode type", path_name);
+	return errmsg("file '%s' has unknown inode type", path_name);
 }
 
 /**
@@ -1999,7 +1924,7 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 {
 	struct dirent *entry;
 	DIR *dir = NULL;
-	int err = 0;
+	int kname_len, err = 0;
 	loff_t size = UBIFS_INO_NODE_SZ;
 	char *name = NULL;
 	unsigned int nlink = 2;
@@ -2010,11 +1935,11 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 	unsigned char type;
 	unsigned long long dir_creat_sqnum = ++c->max_sqnum;
 
-	dbg_msg(2, "%s", dir_name);
+	pr_debug("%s\n", dir_name);
 	if (existing) {
 		dir = opendir(dir_name);
 		if (dir == NULL)
-			return sys_err_msg("cannot open directory '%s'",
+			return sys_errmsg("cannot open directory '%s'",
 					   dir_name);
 	}
 
@@ -2038,7 +1963,7 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 		if (!entry) {
 			if (errno == 0)
 				break;
-			sys_err_msg("error reading directory '%s'", dir_name);
+			sys_errmsg("error reading directory '%s'", dir_name);
 			goto out_free;
 		}
 
@@ -2065,7 +1990,7 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 		free(name);
 		name = make_path(dir_name, entry->d_name);
 		if (lstat(name, &dent_st) == -1) {
-			sys_err_msg("lstat failed for file '%s'", name);
+			sys_errmsg("lstat failed for file '%s'", name);
 			goto out_free;
 		}
 
@@ -2112,13 +2037,13 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 			goto out_free;
 		}
 
-		err = add_dent_node(dir_inum, entry->d_name, inum, type, fctx);
+		err = add_dent_node(dir_inum, entry->d_name, inum, type, fctx,
+				    &kname_len);
 		if (err) {
 			free_fscrypt_context(new_fctx);
 			goto out_free;
 		}
-		size += ALIGN(UBIFS_DENT_NODE_SZ + strlen(entry->d_name) + 1,
-			      8);
+		size += ALIGN(UBIFS_DENT_NODE_SZ + kname_len + 1, 8);
 
 		if (new_fctx)
 			free_fscrypt_context(new_fctx);
@@ -2139,7 +2064,7 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 		 * files.
 		 */
 		if (S_ISREG(nh_elt->mode)) {
-			err_msg("Bad device table entry %s/%s - it is "
+			errmsg("Bad device table entry %s/%s - it is "
 				"prohibited to create regular files "
 				"via device table",
 				strcmp(ph_elt->path, "/") ? ph_elt->path : "",
@@ -2183,13 +2108,14 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 			goto out_free;
 		}
 
-		err = add_dent_node(dir_inum, nh_elt->name, inum, type, fctx);
+		err = add_dent_node(dir_inum, nh_elt->name, inum, type, fctx,
+				    &kname_len);
 		if (err) {
 			free_fscrypt_context(new_fctx);
 			goto out_free;
 		}
 
-		size += ALIGN(UBIFS_DENT_NODE_SZ + strlen(nh_elt->name) + 1, 8);
+		size += ALIGN(UBIFS_DENT_NODE_SZ + kname_len + 1, 8);
 
 		nh_elt = next_name_htbl_element(ph_elt, &itr);
 		if (new_fctx)
@@ -2205,7 +2131,7 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 
 	free(name);
 	if (existing && closedir(dir) == -1)
-		return sys_err_msg("error closing directory '%s'", dir_name);
+		return sys_errmsg("error closing directory '%s'", dir_name);
 
 	return 0;
 
@@ -2229,7 +2155,7 @@ static int add_multi_linked_files(void)
 		unsigned char type = 0;
 
 		for (im = hash_table[i]; im; im = im->next) {
-			dbg_msg(2, "%s", im->path_name);
+			pr_debug("%s\n", im->path_name);
 			err = add_non_dir(im->path_name, &im->use_inum,
 					  im->use_nlink, &type, &im->st, NULL);
 			if (err)
@@ -2252,7 +2178,7 @@ static int write_data(void)
 	if (root) {
 		err = stat(root, &root_st);
 		if (err)
-			return sys_err_msg("bad root file-system directory '%s'",
+			return sys_errmsg("bad root file-system directory '%s'",
 					   root);
 		if (squash_owner)
 			root_st.st_uid = root_st.st_gid = 0;
@@ -2306,7 +2232,7 @@ static int cmp_idx(const void *a, const void *b)
 	const struct idx_entry *e2 = *(const struct idx_entry **)b;
 	int cmp;
 
-	cmp = keys_cmp(&e1->key, &e2->key);
+	cmp = keys_cmp(c, &e1->key, &e2->key);
 	if (cmp)
 		return cmp;
 	return namecmp(e1, e2);
@@ -2323,7 +2249,7 @@ static int add_idx_node(void *node, int child_cnt)
 
 	len = ubifs_idx_node_sz(c, child_cnt);
 
-	prepare_node(node, len);
+	ubifs_prepare_node(c, node, len, 0);
 
 	err = reserve_space(len, &lnum, &offs);
 	if (err)
@@ -2332,10 +2258,10 @@ static int add_idx_node(void *node, int child_cnt)
 	memcpy(leb_buf + offs, node, len);
 	memset(leb_buf + offs + len, 0xff, ALIGN(len, 8) - len);
 
-	c->old_idx_sz += ALIGN(len, 8);
+	c->bi.old_idx_sz += ALIGN(len, 8);
 
-	dbg_msg(3, "at %d:%d len %d index size %llu", lnum, offs, len,
-		c->old_idx_sz);
+	pr_debug("at %d:%d len %d index size %llu\n", lnum, offs, len,
+		 c->bi.old_idx_sz);
 
 	/* The last index node written will be the root */
 	c->zroot.lnum = lnum;
@@ -2357,7 +2283,7 @@ static int write_index(void)
 	int child_cnt = 0, j, level, blnum, boffs, blen, blast_len, err;
 	uint8_t *hashes;
 
-	dbg_msg(1, "leaf node count: %zd", idx_cnt);
+	pr_debug("leaf node count: %zd\n", idx_cnt);
 
 	/* Reset the head for the index */
 	head_flags = LPROPS_INDEX;
@@ -2368,7 +2294,7 @@ static int write_index(void)
 	sz = idx_cnt * sizeof(struct idx_entry *);
 	if (sz / sizeof(struct idx_entry *) != idx_cnt) {
 		free(idx);
-		return err_msg("index is too big (%zu entries)", idx_cnt);
+		return errmsg("index is too big (%zu entries)", idx_cnt);
 	}
 	idx_ptr = xmalloc(sz);
 	idx_ptr[0] = idx_list_first;
@@ -2402,15 +2328,15 @@ static int write_index(void)
 		idx->level = cpu_to_le16(0);
 		for (j = 0; j < child_cnt; j++, p++) {
 			br = ubifs_idx_branch(c, idx, j);
-			key_write_idx(&(*p)->key, &br->key);
+			key_write_idx(c, &(*p)->key, &br->key);
 			br->lnum = cpu_to_le32((*p)->lnum);
 			br->offs = cpu_to_le32((*p)->offs);
 			br->len = cpu_to_le32((*p)->len);
-			memcpy(ubifs_branch_hash(br), (*p)->hash, c->hash_len);
+			memcpy(ubifs_branch_hash(c, br), (*p)->hash, c->hash_len);
 		}
 		add_idx_node(idx, child_cnt);
 
-		ubifs_node_calc_hash(idx, hashes + i * c->hash_len);
+		ubifs_node_calc_hash(c, idx, hashes + i * c->hash_len);
 	}
 	/* Write level 1 index nodes and above */
 	level = 0;
@@ -2477,7 +2403,7 @@ static int write_index(void)
 				 * of the index node from the level below.
 				 */
 				br = ubifs_idx_branch(c, idx, j);
-				key_write_idx(&(*p)->key, &br->key);
+				key_write_idx(c, &(*p)->key, &br->key);
 				br->lnum = cpu_to_le32(blnum);
 				br->offs = cpu_to_le32(boffs);
 				br->len = cpu_to_le32(blen);
@@ -2488,12 +2414,12 @@ static int write_index(void)
 				boffs += ALIGN(blen, 8);
 				p += pstep;
 
-				memcpy(ubifs_branch_hash(br),
+				memcpy(ubifs_branch_hash(c, br),
 				       hashes + bn * c->hash_len,
 				       c->hash_len);
 			}
 			add_idx_node(idx, child_cnt);
-			ubifs_node_calc_hash(idx, hashes + i * c->hash_len);
+			ubifs_node_calc_hash(c, idx, hashes + i * c->hash_len);
 		}
 	}
 
@@ -2507,13 +2433,13 @@ static int write_index(void)
 	free(idx_ptr);
 	free(idx);
 
-	dbg_msg(1, "zroot is at %d:%d len %d", c->zroot.lnum, c->zroot.offs,
-		c->zroot.len);
+	pr_debug("zroot is at %d:%d len %d\n", c->zroot.lnum, c->zroot.offs,
+		 c->zroot.len);
 
 	/* Set the index head */
 	c->ihead_lnum = head_lnum;
 	c->ihead_offs = ALIGN(head_offs, c->min_io_size);
-	dbg_msg(1, "ihead is at %d:%d", c->ihead_lnum, c->ihead_offs);
+	pr_debug("ihead is at %d:%d\n", c->ihead_lnum, c->ihead_offs);
 
 	/* Flush the last index LEB */
 	err = flush_nodes();
@@ -2546,7 +2472,7 @@ static int finalize_leb_cnt(void)
 {
 	c->leb_cnt = head_lnum;
 	if (c->leb_cnt > c->max_leb_cnt)
-		return err_msg("max_leb_cnt too low (%d needed)", c->leb_cnt);
+		return errmsg("max_leb_cnt too low (%d needed)", c->leb_cnt);
 	c->main_lebs = c->leb_cnt - c->main_first;
 	if (verbose) {
 		printf("\tsuper lebs:   %d\n", UBIFS_SB_LEBS);
@@ -2559,13 +2485,13 @@ static int finalize_leb_cnt(void)
 		printf("\tindex lebs:   %d\n", c->lst.idx_lebs);
 		printf("\tleb_cnt:      %d\n", c->leb_cnt);
 	}
-	dbg_msg(1, "total_free:  %llu", c->lst.total_free);
-	dbg_msg(1, "total_dirty: %llu", c->lst.total_dirty);
-	dbg_msg(1, "total_used:  %llu", c->lst.total_used);
-	dbg_msg(1, "total_dead:  %llu", c->lst.total_dead);
-	dbg_msg(1, "total_dark:  %llu", c->lst.total_dark);
-	dbg_msg(1, "index size:  %llu", c->old_idx_sz);
-	dbg_msg(1, "empty_lebs:  %d", c->lst.empty_lebs);
+	pr_debug("total_free:  %llu\n", c->lst.total_free);
+	pr_debug("total_dirty: %llu\n", c->lst.total_dirty);
+	pr_debug("total_used:  %llu\n", c->lst.total_used);
+	pr_debug("total_dead:  %llu\n", c->lst.total_dead);
+	pr_debug("total_dark:  %llu\n", c->lst.total_dark);
+	pr_debug("index size:  %llu\n", c->bi.old_idx_sz);
+	pr_debug("empty_lebs:  %d\n", c->lst.empty_lebs);
 	return 0;
 }
 
@@ -2591,7 +2517,6 @@ static int write_super(void)
 	buf = xzalloc(c->leb_size);
 
 	sup = buf;
-	sig = buf + UBIFS_SB_NODE_SZ;
 
 	sup->ch.node_type  = UBIFS_SB_NODE;
 	sup->key_hash      = c->key_hash_type;
@@ -2627,27 +2552,27 @@ static int write_super(void)
 		sup->flags |= cpu_to_le32(UBIFS_FLG_DOUBLE_HASH);
 	if (c->encrypted)
 		sup->flags |= cpu_to_le32(UBIFS_FLG_ENCRYPTION);
-	if (authenticated()) {
+	if (ubifs_authenticated(c)) {
 		sup->flags |= cpu_to_le32(UBIFS_FLG_AUTHENTICATION);
 		memcpy(sup->hash_mst, c->mst_hash, c->hash_len);
 	}
 
-	prepare_node(sup, UBIFS_SB_NODE_SZ);
+	ubifs_prepare_node(c, sup, UBIFS_SB_NODE_SZ, 0);
 
-	err = sign_superblock_node(sup);
+	err = ubifs_sign_superblock_node(c, sup);
 	if (err)
 		goto out;
 
 	sig = (void *)(sup + 1);
-	prepare_node(sig, UBIFS_SIG_NODE_SZ + le32_to_cpu(sig->len));
+	ubifs_prepare_node(c, sig, UBIFS_SIG_NODE_SZ + le32_to_cpu(sig->len), 1);
 
-	len = do_pad(sig, UBIFS_SIG_NODE_SZ + le32_to_cpu(sig->len));
+	len = ALIGN(ALIGN(UBIFS_SIG_NODE_SZ + le32_to_cpu(sig->len), 8), c->min_io_size);
+	memset(buf + UBIFS_SB_NODE_SZ + len, 0xff, c->leb_size - (UBIFS_SB_NODE_SZ + len));
 
-	err = write_leb(UBIFS_SB_LNUM, UBIFS_SB_NODE_SZ + len, sup);
+	err = ubifs_leb_change(c, UBIFS_SB_LNUM, buf, c->leb_size);
 	if (err)
 		goto out;
 
-	err = 0;
 out:
 	free(buf);
 
@@ -2675,7 +2600,7 @@ static int write_master(void)
 	mst.gc_lnum      = cpu_to_le32(c->gc_lnum);
 	mst.ihead_lnum   = cpu_to_le32(c->ihead_lnum);
 	mst.ihead_offs   = cpu_to_le32(c->ihead_offs);
-	mst.index_size   = cpu_to_le64(c->old_idx_sz);
+	mst.index_size   = cpu_to_le64(c->bi.old_idx_sz);
 	mst.lpt_lnum     = cpu_to_le32(c->lpt_lnum);
 	mst.lpt_offs     = cpu_to_le32(c->lpt_offs);
 	mst.nhead_lnum   = cpu_to_le32(c->nhead_lnum);
@@ -2694,7 +2619,7 @@ static int write_master(void)
 	mst.total_dark   = cpu_to_le64(c->lst.total_dark);
 	mst.leb_cnt      = cpu_to_le32(c->leb_cnt);
 
-	if (authenticated()) {
+	if (ubifs_authenticated(c)) {
 		memcpy(mst.hash_root_idx, c->root_idx_hash, c->hash_len);
 		memcpy(mst.hash_lpt, c->lpt_hash, c->hash_len);
 	}
@@ -2707,7 +2632,9 @@ static int write_master(void)
 	if (err)
 		return err;
 
-	mst_node_calc_hash(&mst, c->mst_hash);
+	err = ubifs_master_node_calc_hash(c, &mst, c->mst_hash);
+	if (err)
+		return err;
 
 	return 0;
 }
@@ -2747,7 +2674,8 @@ static int write_lpt(void)
 {
 	int err, lnum;
 
-	err = create_lpt(c);
+	c->lscan_lnum = c->main_first;
+	err = ubifs_create_lpt(c, c->lpt, c->main_lebs, c->lpt_hash, true);
 	if (err)
 		return err;
 
@@ -2778,87 +2706,11 @@ static int write_orphan_area(void)
 }
 
 /**
- * check_volume_empty - check if the UBI volume is empty.
- *
- * This function checks if the UBI volume is empty by looking if its LEBs are
- * mapped or not.
- *
- * Returns %0 in case of success, %1 is the volume is not empty,
- * and a negative error code in case of failure.
- */
-static int check_volume_empty(void)
-{
-	int lnum, err;
-
-	for (lnum = 0; lnum < c->vi.rsvd_lebs; lnum++) {
-		err = ubi_is_mapped(out_fd, lnum);
-		if (err < 0)
-			return err;
-		if (err == 1)
-			return 1;
-	}
-	return 0;
-}
-
-/**
- * open_target - open the output target.
- *
- * Open the output target. The target can be an UBI volume
- * or a file.
- *
- * Returns %0 in case of success and %-1 in case of failure.
- */
-static int open_target(void)
-{
-	if (out_ubi) {
-		out_fd = open(output, O_RDWR | O_EXCL);
-
-		if (out_fd == -1)
-			return sys_err_msg("cannot open the UBI volume '%s'",
-					   output);
-		if (ubi_set_property(out_fd, UBI_VOL_PROP_DIRECT_WRITE, 1))
-			return sys_err_msg("ubi_set_property failed");
-
-		if (!yes && check_volume_empty()) {
-			if (!prompt("UBI volume is not empty.  Format anyways?", false))
-				return err_msg("UBI volume is not empty");
-		}
-	} else {
-		out_fd = open(output, O_CREAT | O_RDWR | O_TRUNC,
-			      S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
-		if (out_fd == -1)
-			return sys_err_msg("cannot create output file '%s'",
-					   output);
-	}
-	return 0;
-}
-
-
-/**
- * close_target - close the output target.
- *
- * Close the output target. If the target was an UBI
- * volume, also close libubi.
- *
- * Returns %0 in case of success and %-1 in case of failure.
- */
-static int close_target(void)
-{
-	if (ubi)
-		libubi_close(ubi);
-	if (out_fd >= 0 && close(out_fd) == -1)
-		return sys_err_msg("cannot close the target '%s'", output);
-	if (output)
-		free(output);
-	return 0;
-}
-
-/**
  * init - initialize things.
  */
 static int init(void)
 {
-	int err, i, main_lebs, big_lpt = 0, sz;
+	int err, main_lebs, big_lpt = 0, sz;
 
 	c->highest_inum = UBIFS_FIRST_INO;
 
@@ -2867,7 +2719,7 @@ static int init(void)
 	main_lebs = c->max_leb_cnt - UBIFS_SB_LEBS - UBIFS_MST_LEBS;
 	main_lebs -= c->log_lebs + c->orph_lebs;
 
-	err = calc_dflt_lpt_geom(c, &main_lebs, &big_lpt);
+	err = ubifs_calc_dflt_lpt_geom(c, &main_lebs, &big_lpt);
 	if (err)
 		return err;
 
@@ -2880,17 +2732,10 @@ static int init(void)
 	c->lpt_last = c->lpt_first + c->lpt_lebs - 1;
 
 	c->lpt = xmalloc(c->main_lebs * sizeof(struct ubifs_lprops));
-	c->ltab = xmalloc(c->lpt_lebs * sizeof(struct ubifs_lprops));
-
-	/* Initialize LPT's own lprops */
-	for (i = 0; i < c->lpt_lebs; i++) {
-		c->ltab[i].free = c->leb_size;
-		c->ltab[i].dirty = 0;
-	}
 
 	c->dead_wm = ALIGN(MIN_WRITE_SZ, c->min_io_size);
 	c->dark_wm = ALIGN(UBIFS_MAX_NODE_SZ, c->min_io_size);
-	dbg_msg(1, "dead_wm %d  dark_wm %d", c->dead_wm, c->dark_wm);
+	pr_debug("dead_wm %d  dark_wm %d\n", c->dead_wm, c->dark_wm);
 
 	leb_buf = xmalloc(c->leb_size);
 	node_buf = xmalloc(NODE_BUFFER_SIZE);
@@ -2911,7 +2756,7 @@ static int init(void)
 
 		sehnd = selabel_open(SELABEL_CTX_FILE, seopts, 1);
 		if (!sehnd)
-			return err_msg("could not open selinux context\n");
+			return errmsg("could not open selinux context\n");
 	}
 #endif
 
@@ -2946,7 +2791,6 @@ static void deinit(void)
 #endif
 
 	free(c->lpt);
-	free(c->ltab);
 	free(leb_buf);
 	free(node_buf);
 	free(block_buf);
@@ -2954,6 +2798,7 @@ static void deinit(void)
 	free(hash_table);
 	destroy_compression();
 	free_devtable_info();
+	ubifs_exit_authentication(c);
 }
 
 /**
@@ -2973,7 +2818,7 @@ static int mkfs(void)
 	if (err)
 		goto out;
 
-	err = init_authentication();
+	err = ubifs_init_authentication(c);
 	if (err)
 		goto out;
 
@@ -3020,30 +2865,41 @@ int main(int argc, char *argv[])
 {
 	int err;
 
+	init_ubifs_info(c, MKFS_PROGRAM_TYPE);
+
 	if (crypto_init())
 		return -1;
 
 	err = get_options(argc, argv);
 	if (err)
-		return err;
+		goto out;
 
-	err = open_target();
+	err = open_target(c);
 	if (err)
-		return err;
+		goto out;
+
+	if (!yes && check_volume_empty(c)) {
+		if (!prompt("UBI volume is not empty.  Format anyways?", false)) {
+			close_target(c);
+			err = errmsg("UBI volume is not empty");
+			goto out;
+		}
+	}
 
 	err = mkfs();
 	if (err) {
-		close_target();
-		return err;
+		close_target(c);
+		goto out;
 	}
 
-	err = close_target();
-	if (err)
-		return err;
+	err = close_target(c);
 
-	if (verbose)
+	if (verbose && !err)
 		printf("Success!\n");
 
+out:
+	free(c->dev_name);
+	close_ubi(c);
 	crypto_cleanup();
-	return 0;
+	return err;
 }

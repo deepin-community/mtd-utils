@@ -23,6 +23,7 @@
  * Author: Adrian Hunter <adrian.hunter@nokia.com>
  */
 #define DESTRUCTIVE 0x01
+#define CONTINOUS 0x02
 
 #define PROGRAM_NAME "flash_speed"
 
@@ -33,6 +34,7 @@
 #include <stdlib.h>
 #include <libmtd.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <time.h>
@@ -46,7 +48,9 @@ static const char *mtddev;
 static libmtd_t mtd_desc;
 static int fd;
 
-static int peb=-1, count=-1, skip=-1, flags=0;
+static int npages = 1;
+static int peb=-1, count=-1, skip=-1, flags=0, speb=-1;
+static bool continuous = false;
 static struct timespec start, finish;
 static int pgsize, pgcnt;
 static int goodebcnt;
@@ -57,6 +61,8 @@ static const struct option options[] = {
 	{ "peb", required_argument, NULL, 'b' },
 	{ "count", required_argument, NULL, 'c' },
 	{ "skip", required_argument, NULL, 's' },
+	{ "sec-peb", required_argument, NULL, 'k' },
+	{ "continuous", no_argument, NULL, 'C' },
 	{ NULL, 0, NULL, 0 },
 };
 
@@ -69,7 +75,9 @@ static NORETURN void usage(int status)
 	"  -b, --peb <num>     Start from this physical erase block\n"
 	"  -c, --count <num>   Number of erase blocks to use (default: all)\n"
 	"  -s, --skip <num>    Number of blocks to skip\n"
-	"  -d, --destructive   Run destructive (erase and write speed) tests\n",
+	"  -d, --destructive   Run destructive (erase and write speed) tests\n"
+	"  -k, --sec-peb <num> Start of secondary block to measure RWW latency (requires -d)\n"
+	"  -C, --continuous    Increase the number of consecutive pages gradually\n",
 	status==EXIT_SUCCESS ? stdout : stderr);
 	exit(status);
 }
@@ -93,7 +101,7 @@ static void process_options(int argc, char **argv)
 	int c;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hb:c:s:d", options, NULL);
+		c = getopt_long(argc, argv, "hb:c:s:dk:C", options, NULL);
 		if (c == -1)
 			break;
 
@@ -126,15 +134,29 @@ static void process_options(int argc, char **argv)
 				goto failmulti;
 			flags |= DESTRUCTIVE;
 			break;
+		case 'k':
+			if (speb >= 0)
+				goto failmulti;
+			speb = read_num(c, optarg);
+			if (speb < 0)
+				goto failarg;
+			break;
+		case 'C':
+			continuous = true;
+			break;
 		default:
 			exit(EXIT_FAILURE);
 		}
 	}
 
-	if (optind < argc)
-		mtddev = argv[optind++];
-	else
+	if (optind < argc) {
+		mtddev = mtd_find_dev_node(argv[optind]);
+		if (!mtddev)
+			errmsg_die("Can't find MTD device %s", argv[optind]);
+		optind++;
+	} else {
 		errmsg_die("No device specified!\n");
+	}
 
 	if (optind < argc)
 		usage(EXIT_FAILURE);
@@ -144,11 +166,15 @@ static void process_options(int argc, char **argv)
 		skip = 0;
 	if (count < 0)
 		count = 1;
+	if (speb >= 0 && !(flags & DESTRUCTIVE))
+		goto faildestr;
 	return;
 failmulti:
 	errmsg_die("'-%c' specified more than once!\n", c);
 failarg:
 	errmsg_die("Invalid argument for '-%c'!\n", c);
+faildestr:
+	errmsg_die("'-k' specified, -d is missing!\n");
 }
 
 static int write_eraseblock(int ebnum)
@@ -214,71 +240,56 @@ static int write_eraseblock_by_2pages(int ebnum)
 	return err;
 }
 
-static int read_eraseblock_by_page(int ebnum)
+static int read_eraseblock_by_npages(int ebnum)
 {
-	void *buf = iobuf;
-	int i, err = 0;
-
-	for (i = 0; i < pgcnt; ++i) {
-		err = mtd_read(&mtd, fd, ebnum, i * pgsize, iobuf, pgsize);
-		if (err) {
-			fprintf(stderr, "Error reading block %d, page %d!\n",
-					ebnum, i);
-			break;
-		}
-		buf += pgsize;
-	}
-
-	return err;
-}
-
-static int read_eraseblock_by_2pages(int ebnum)
-{
-	int i, n = pgcnt / 2, err = 0;
-	size_t sz = pgsize * 2;
+	int i, n = pgcnt / npages, err = 0;
+	size_t sz = pgsize * npages;
 	void *buf = iobuf;
 
 	for (i = 0; i < n; ++i) {
 		err = mtd_read(&mtd, fd, ebnum, i * sz, iobuf, sz);
 		if (err) {
-			fprintf(stderr, "Error reading block %d, page %d + %d!\n",
-					ebnum, i*2, i*2+1);
+			fprintf(stderr, "Error reading block %d, page [%d-%d]!\n",
+				ebnum, i*npages, (i*npages) + npages- 1);
 			return err;
 		}
 		buf += sz;
-	}
-	if (pgcnt % 2) {
-		err = mtd_read(&mtd, fd, ebnum, i * sz, iobuf, pgsize);
-		if (err) {
-			fprintf(stderr, "Error reading block %d, page %d!\n",
-					ebnum, i*2);
-		}
 	}
 
 	return err;
 }
 
-static void start_timing(void)
+static void start_timing(struct timespec *start)
 {
-	clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+	clock_gettime(CLOCK_MONOTONIC_RAW, start);
 }
 
-static void stop_timing(void)
+static void stop_timing(struct timespec *finish)
 {
-	clock_gettime(CLOCK_MONOTONIC_RAW, &finish);
+	clock_gettime(CLOCK_MONOTONIC_RAW, finish);
 }
 
-static long calc_speed(void)
+static long calc_duration(struct timespec *start, struct timespec *finish)
 {
 	long ms;
 
-	ms = (finish.tv_sec - start.tv_sec) * 1000L;
-	ms += (finish.tv_nsec - start.tv_nsec) / 1000000L;
+	ms = (finish->tv_sec - start->tv_sec) * 1000L;
+	ms += (finish->tv_nsec - start->tv_nsec) / 1000000L;
+
+	return ms;
+}
+
+static long calc_speed(struct timespec *start, struct timespec *finish,
+		       int pages_per_set)
+{
+	long ms = calc_duration(start, finish);
+	int sets_in_eb = pgcnt / pages_per_set;
+	size_t sz = pgsize * pages_per_set * sets_in_eb;
 
 	if (ms <= 0)
 		return 0;
 
-	return ((long)goodebcnt * (mtd.eb_size / 1024L) * 1000L) / ms;
+	return ((long)goodebcnt * (sz / 1024L) * 1000L) / ms;
 }
 
 static void scan_for_bad_eraseblocks(unsigned int eb, int ebcnt, int ebskip)
@@ -313,8 +324,34 @@ static int erase_good_eraseblocks(unsigned int eb, int ebcnt, int ebskip)
 	return err;
 }
 
-#define TIME_OP_PER_PEB( op )\
-		start_timing();\
+struct thread_arg {
+	int (*op)(int peb);
+	int peb;
+	struct timespec start;
+	struct timespec finish;
+};
+
+static void *op_thread(void *ptr)
+{
+	struct thread_arg *args = ptr;
+	unsigned long err = 0;
+	int i;
+
+	start_timing(&args->start);
+	for (i = 0; i < count; ++i) {
+		if (bbt[i])
+			continue;
+		err = args->op(args->peb + i * (skip + 1));
+		if (err)
+			break;
+	}
+	stop_timing(&args->finish);
+
+	return (void *)err;
+}
+
+#define TIME_OP_PER_PEB( op, npages )			\
+		start_timing(&start);\
 		for (i = 0; i < count; ++i) {\
 			if (bbt[i])\
 				continue;\
@@ -322,8 +359,8 @@ static int erase_good_eraseblocks(unsigned int eb, int ebcnt, int ebskip)
 			if (err)\
 				goto out;\
 		}\
-		stop_timing();\
-		speed = calc_speed()
+		stop_timing(&finish);\
+		speed = calc_speed(&start, &finish, npages)
 
 int main(int argc, char **argv)
 {
@@ -343,7 +380,7 @@ int main(int argc, char **argv)
 		puts("not NAND flash, assume page size is 512 bytes.");
 		pgsize = 512;
 	} else {
-		pgsize = mtd.subpage_size;
+		pgsize = mtd.min_io_size;
 	}
 
 	pgcnt = mtd.eb_size / pgsize;
@@ -384,13 +421,13 @@ int main(int argc, char **argv)
 			goto out;
 
 		puts("testing eraseblock write speed");
-		TIME_OP_PER_PEB(write_eraseblock);
+		TIME_OP_PER_PEB(write_eraseblock, 1);
 		printf("eraseblock write speed is %ld KiB/s\n", speed);
 	}
 
 	/* Read all eraseblocks, 1 eraseblock at a time */
 	puts("testing eraseblock read speed");
-	TIME_OP_PER_PEB(read_eraseblock);
+	TIME_OP_PER_PEB(read_eraseblock, 1);
 	printf("eraseblock read speed is %ld KiB/s\n", speed);
 
 	/* Write all eraseblocks, 1 page at a time */
@@ -400,40 +437,55 @@ int main(int argc, char **argv)
 			goto out;
 
 		puts("testing page write speed");
-		TIME_OP_PER_PEB(write_eraseblock_by_page);
+		TIME_OP_PER_PEB(write_eraseblock_by_page, 1);
 		printf("page write speed is %ld KiB/s\n", speed);
 	}
 
 	/* Read all eraseblocks, 1 page at a time */
 	puts("testing page read speed");
-	TIME_OP_PER_PEB(read_eraseblock_by_page);
+	npages = 1;
+	TIME_OP_PER_PEB(read_eraseblock_by_npages, npages);
 	printf("page read speed is %ld KiB/s\n", speed);
 
-	/* Write all eraseblocks, 2 pages at a time */
-	if (flags & DESTRUCTIVE) {
-		err = erase_good_eraseblocks(peb, count, skip);
-		if (err)
-			goto out;
+	if (continuous) {
+		/* Write all eraseblocks, 2 pages at a time */
+		if (flags & DESTRUCTIVE) {
+			err = erase_good_eraseblocks(peb, count, skip);
+			if (err)
+				goto out;
 
-		puts("testing 2 page write speed");
-		TIME_OP_PER_PEB(write_eraseblock_by_2pages);
-		printf("2 page write speed is %ld KiB/s\n", speed);
+			puts("testing 2 page write speed");
+			TIME_OP_PER_PEB(write_eraseblock_by_2pages, 2);
+			printf("2 page write speed is %ld KiB/s\n", speed);
+		}
+
+		/* Read all eraseblocks, N pages at a time */
+		puts("testing multiple pages read speed");
+		for (npages = 2; npages <= 16 && npages <= pgcnt; npages++) {
+			TIME_OP_PER_PEB(read_eraseblock_by_npages, npages);
+			printf("%d page read speed is %ld KiB/s\n", npages, speed);
+		}
+		if (pgcnt >= 32) {
+			npages = 32;
+			TIME_OP_PER_PEB(read_eraseblock_by_npages, npages);
+			printf("%d page read speed is %ld KiB/s\n", npages, speed);
+		}
+		if (pgcnt >= 64) {
+			npages = 64;
+			TIME_OP_PER_PEB(read_eraseblock_by_npages, npages);
+			printf("%d page read speed is %ld KiB/s\n", npages, speed);
+		}
 	}
-
-	/* Read all eraseblocks, 2 pages at a time */
-	puts("testing 2 page read speed");
-	TIME_OP_PER_PEB(read_eraseblock_by_2pages);
-	printf("2 page read speed is %ld KiB/s\n", speed);
 
 	/* Erase all eraseblocks */
 	if (flags & DESTRUCTIVE) {
 		puts("Testing erase speed");
-		start_timing();
+		start_timing(&start);
 		err = erase_good_eraseblocks(peb, count, skip);
 		if (err)
 			goto out;
-		stop_timing();
-		speed = calc_speed();
+		stop_timing(&finish);
+		speed = calc_speed(&start, &finish, 1);
 		printf("erase speed is %ld KiB/s\n", speed);
 	}
 
@@ -442,7 +494,7 @@ int main(int argc, char **argv)
 		for (k = 1; k < 7; ++k) {
 			blocks = 1 << k;
 			printf("Testing %dx multi-block erase speed\n", blocks);
-			start_timing();
+			start_timing(&start);
 			for (i = 0; i < count; ) {
 				for (j = 0; j < blocks && (i + j) < count; ++j)
 					if (bbt[i + j])
@@ -456,11 +508,91 @@ int main(int argc, char **argv)
 					goto out;
 				i += j;
 			}
-			stop_timing();
-			speed = calc_speed();
+			stop_timing(&finish);
+			speed = calc_speed(&start, &finish, 1);
 			printf("%dx multi-block erase speed is %ld KiB/s\n",
 					blocks, speed);
 		}
+	}
+
+	/* Write a page and immediately after try to read another page. Report
+	 * the latency difference when performed on different banks (NOR only).
+	 */
+	if (speb >= 0 && mtd.subpage_size == 1) {
+		long rww_duration_w, rww_latency_end;
+		long rww_duration_rnw, rww_duration_r_end;
+		bool rww_r_end_first;
+		struct thread_arg write_args_peb = {
+			.op = write_eraseblock,
+			.peb = peb,
+		};
+		struct thread_arg read_args_speb = {
+			.op = read_eraseblock,
+			.peb = speb,
+		};
+		struct sched_param param_write, param_read;
+		pthread_attr_t attr_write, attr_read;
+		pthread_t write_thread, read_thread;
+		void *retval;
+
+		puts("testing read while write latency");
+
+		/* Change scheduling priorities so that the write thread gets
+		 *scheduled more aggressively than the read thread.
+		 */
+		pthread_attr_init(&attr_write);
+		pthread_attr_setinheritsched(&attr_write, PTHREAD_EXPLICIT_SCHED);
+		pthread_attr_setschedpolicy(&attr_write, SCHED_FIFO);
+		param_write.sched_priority = 42;
+		pthread_attr_setschedparam(&attr_write, &param_write);
+
+		pthread_attr_init(&attr_read);
+		pthread_attr_setinheritsched(&attr_read, PTHREAD_EXPLICIT_SCHED);
+		pthread_attr_setschedpolicy(&attr_read, SCHED_FIFO);
+		param_read.sched_priority = 41;
+		pthread_attr_setschedparam(&attr_read, &param_read);
+
+		err = pthread_create(&write_thread, &attr_write,
+				     (void *)op_thread, &write_args_peb);
+		if (err) {
+			errmsg("parallel write pthread create failed");
+			goto out;
+		}
+
+		err = pthread_create(&read_thread, &attr_read,
+				     (void *)op_thread, &read_args_speb);
+		if (err) {
+			errmsg("parallel read pthread create failed");
+			goto out;
+		}
+
+		pthread_join(read_thread, &retval);
+		if ((long)retval) {
+			errmsg("parallel read pthread failed");
+			goto out;
+		}
+
+		pthread_join(write_thread, &retval);
+		if ((long)retval) {
+			errmsg("parallel write pthread failed");
+			goto out;
+		}
+
+		rww_duration_w = calc_duration(&write_args_peb.start,
+					       &write_args_peb.finish);
+		rww_latency_end = calc_duration(&write_args_peb.finish,
+						&read_args_speb.finish);
+		rww_r_end_first = rww_latency_end < 0;
+		if (rww_r_end_first)
+			rww_duration_rnw = rww_duration_w;
+		else
+			rww_duration_rnw = calc_duration(&write_args_peb.start,
+							 &read_args_speb.finish);
+
+		rww_duration_r_end = calc_duration(&write_args_peb.start,
+						   &read_args_speb.finish);
+		printf("read while write took %ldms, read ended after %ldms\n",
+		       rww_duration_rnw, rww_duration_r_end);
 	}
 
 	puts("finished");
